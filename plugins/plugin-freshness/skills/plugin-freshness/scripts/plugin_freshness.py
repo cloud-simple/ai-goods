@@ -344,9 +344,14 @@ def available_version(m: Marketplace, entry: dict) -> Optional[str]:
     return str(entry["version"]) if entry.get("version") else None
 
 
+def raise_error(err: OSError) -> None:
+    raise err
+
+
 def plugin_files(root: str) -> dict:
+    """Map relative path -> full path. Raises OSError for a directory it cannot read."""
     out = {}
-    for d, dirs, files in os.walk(root):
+    for d, dirs, files in os.walk(root, onerror=raise_error):
         dirs[:] = [x for x in dirs if x not in IGNORED_NAMES]
         for f in files:
             if f not in IGNORED_NAMES and not f.endswith(".pyc"):
@@ -359,14 +364,14 @@ def count_changed_files(installed_dir: str, market_dir: str) -> Optional[int]:
     """Number of files added, removed or changed between two plugin directories, or None when one is missing."""
     if not (os.path.isdir(installed_dir) and os.path.isdir(market_dir)):
         return None
-    a, b = plugin_files(installed_dir), plugin_files(market_dir)
-    changed = len(set(a) ^ set(b))
-    for rel in set(a) & set(b):
-        try:
+    try:
+        a, b = plugin_files(installed_dir), plugin_files(market_dir)
+        changed = len(set(a) ^ set(b))
+        for rel in set(a) & set(b):
             if not filecmp.cmp(a[rel], b[rel], shallow=False):
                 changed += 1
-        except OSError:
-            changed += 1
+    except OSError:
+        return None  # a file or directory could not be read, so no comparison ran
     return changed
 
 
@@ -416,6 +421,9 @@ def judge(p: Plugin, markets: dict) -> None:
             return
         if order > 0:
             p.note = "installed version is newer than the marketplace copy"
+            return
+        if order == 0 and p.available != p.installed:
+            p.note = "versions are written differently but rank equal (build metadata or format)"
             return
         if order < 0:
             p.status, p.note = UPDATE, "marketplace copy has a newer version"
@@ -934,6 +942,28 @@ def run_self_tests() -> int:
             self.assertIn("could not be compared", a.note)
             del self.f.plugins[0]["installPath"]
             self.assertEqual(self.plugin(self.f.report(), "alpha@mkt-a").status, UNKNOWN)
+
+        def test_equal_rank_different_string_is_unknown(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0+old")
+            a = self.plugin(self.f.report(), "alpha@mkt-a")
+            self.assertEqual(a.status, UNKNOWN)
+            self.assertIn("rank equal", a.note)
+
+        def test_unreadable_directory_is_unknown(self):
+            if os.geteuid() == 0:
+                self.skipTest("root reads mode-000 directories")
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0")
+            locked = os.path.join(self.f.pdir, "cache", "mkt-a", "alpha", "1.0.0", "locked")
+            write(os.path.join(locked, "p.txt"), "x")
+            os.chmod(locked, 0)
+            try:
+                a = self.plugin(self.f.report(), "alpha@mkt-a")
+            finally:
+                os.chmod(locked, 0o755)
+            self.assertEqual(a.status, UNKNOWN)
+            self.assertIn("could not be compared", a.note)
 
         def test_newer_installed_version_is_not_an_update(self):
             self.base()
