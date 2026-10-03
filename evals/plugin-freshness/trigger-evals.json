@@ -1,0 +1,22 @@
+[
+  {"query": "are my plugins up to date?", "should_trigger": true},
+  {"query": "check my plugins", "should_trigger": true},
+  {"query": "check marketplace freshness for my claude code setup", "should_trigger": true},
+  {"query": "anything stale in my Claude Code setup? i feel like revmux and agterm got new releases this week", "should_trigger": true},
+  {"query": "is there a newer version of the skill-creator plugin than the one i have installed?", "should_trigger": true},
+  {"query": "which of my installed claude plugins have updates waiting? don't change anything, just tell me", "should_trigger": true},
+  {"query": "my ~/.claude/plugins/cache folder has like 7 versions of skill-creator in it, which of those are leftovers?", "should_trigger": true},
+  {"query": "audit my plugin marketplaces - is the local copy of umputun-cc-thingz behind github?", "should_trigger": true},
+  {"query": "before I start the release can you verify all the claude code plugins and marketplaces are current", "should_trigger": true},
+  {"query": "is context7 outdated? it's installed for the cdn-core-apps project", "should_trigger": true},
+  {"query": "update my plugins", "should_trigger": false},
+  {"query": "upgrade revmux to the latest version", "should_trigger": false},
+  {"query": "refresh all my marketplaces and reinstall anything that changed", "should_trigger": false},
+  {"query": "delete the old plugin versions from ~/.claude/plugins/cache, I don't need them", "should_trigger": false},
+  {"query": "install the forkflow plugin from the ai-thingz marketplace", "should_trigger": false},
+  {"query": "check my npm dependencies for outdated packages in this repo", "should_trigger": false},
+  {"query": "bump the version in plugins/nocomment/.claude-plugin/plugin.json to 0.2.0 and tag the release", "should_trigger": false},
+  {"query": "validate the marketplace.json in this repo before I push it", "should_trigger": false},
+  {"query": "turn on auto-update for the agterm marketplace", "should_trigger": false},
+  {"query": "are my homebrew packages up to date? run brew outdated for me", "should_trigger": false}
+]

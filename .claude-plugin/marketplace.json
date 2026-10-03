@@ -1,0 +1,16 @@
+{
+  "name": "ai-goods",
+  "owner": {
+    "name": "cloud-simple"
+  },
+  "metadata": {
+    "description": "Claude Code skills by cloud-simple, each packaged as its own plugin"
+  },
+  "plugins": [
+    {
+      "name": "plugin-freshness",
+      "source": "./plugins/plugin-freshness",
+      "description": "Read-only check of whether Claude Code plugins and marketplaces are current, with stale and orphaned cache directories and the commands to fix them"
+    }
+  ]
+}
