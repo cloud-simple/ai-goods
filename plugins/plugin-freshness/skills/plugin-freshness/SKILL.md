@@ -67,16 +67,17 @@ A plugin's version string sets how it is judged:
   marketplace version is `update available`. An older one, or two versions that cannot be ordered,
   is `unknown`, so the report never suggests a downgrade.
 - **Same version, different files**: when the versions match, the script compares the installed
-  files with the marketplace copy. Authors sometimes change a plugin without bumping its version.
-  The row reads `update available` only when `installed_plugins.json` shows the plugin came from an
-  older marketplace commit and the marketplace was refreshed after the install. Otherwise the
-  direction is not proved, and the row is `unknown`. The fix is a reinstall with `--keep-data`,
-  because `claude plugin update` compares versions and can report the plugin as current.
+  files with the marketplace copy. Authors sometimes change a plugin without bumping its version,
+  but an edit to the installed copy looks the same, so the row is `unknown` with "same version, but
+  N files differ". The fix command reinstalls with `--keep-data`, because `claude plugin update`
+  compares versions and can report the plugin as current. Tell the user it replaces local edits.
 - **Path-based plugin** (a 12-character commit hash, for example `context7` and `skill-creator`):
-  Claude Code writes the marketplace commit as the version because no manifest has one. The plugin
-  is `current` when that commit equals the marketplace's local commit and the marketplace is current.
-  A different commit is `update available` when the marketplace was refreshed after the install,
-  and `unknown` otherwise: the local copies are shallow, so git history cannot order the commits.
+  Claude Code writes the marketplace commit as the version because no manifest has one. Here
+  `update available` means the marketplace offers another commit, which `claude plugin update`
+  installs. The script says so only when the marketplace was refreshed after the install; otherwise
+  the row is `unknown`. The local copies are shallow, so git history cannot show which commit is
+  newer, and a force-pushed rollback also reads as `update available`. When the commit matches, the
+  installed files are compared as for semver plugins.
 
 A plugin is `current` only when its version and files match the marketplace copy and the
 marketplace is current. Any check that cannot run gives `unknown`, never `current`.

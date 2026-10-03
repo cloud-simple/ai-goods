@@ -172,9 +172,10 @@ def parse_time(value: Optional[str]) -> Optional[datetime.datetime]:
     if not value:
         return None
     try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        t = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)  # Claude Code writes UTC
 
 
 def compare_versions(a: str, b: str) -> Optional[int]:
@@ -369,6 +370,14 @@ def count_changed_files(installed_dir: str, market_dir: str) -> Optional[int]:
     return changed
 
 
+def files_differ_note(p: Plugin, m: Marketplace, n: int) -> str:
+    """State what was observed. A local edit and an upstream change look the same, so no cause is claimed."""
+    note = f"same version, but {n} file{' differs' if n == 1 else 's differ'} from the marketplace copy"
+    if p.git_commit_sha and m.local_head and p.git_commit_sha != m.local_head:
+        note += f"; installed from commit {p.git_commit_sha[:12]}, marketplace copy is at {m.local_head[:12]}"
+    return note
+
+
 def fetched_after_install(p: Plugin, m: Marketplace) -> bool:
     """True when the marketplace copy was refreshed after this installation, from recorded timestamps."""
     market, plugin = parse_time(m.last_updated), parse_time(p.last_updated)
@@ -415,12 +424,7 @@ def judge(p: Plugin, markets: dict) -> None:
         if n is None:
             p.note = "installed files could not be compared with the marketplace copy"
         elif n:
-            files = f"{n} file{' differs' if n == 1 else 's differ'}"
-            if p.git_commit_sha and m.local_head and p.git_commit_sha != m.local_head and fetched_after_install(p, m):
-                p.status, p.changed_files = UPDATE, n
-                p.note = f"same version, but {files}: the marketplace changed after the install without a version bump"
-            else:
-                p.note = f"same version, but {files} between the installed copy and the marketplace copy; the cause is not known"
+            p.changed_files, p.note = n, files_differ_note(p, m, n)
         elif m.status == CURRENT:
             p.status = CURRENT
         else:
@@ -436,10 +440,18 @@ def judge(p: Plugin, markets: dict) -> None:
         return
     p.available = m.local_head[:len(p.installed)]
     if p.available != p.installed:
+        # "Update" here means the marketplace now offers another commit, which `claude plugin update` installs.
+        # Shallow copies cannot show whether that commit is a descendant of the installed one.
         if fetched_after_install(p, m):
-            p.status, p.note = UPDATE, "marketplace copy was refreshed after the install and is at another commit"
+            p.status, p.note = UPDATE, "marketplace offers another commit, refreshed after the install"
         else:
-            p.note = "commits differ, and which one is newer cannot be proved"
+            p.note = "commits differ, and the marketplace copy is not known to be the later one"
+        return
+    n = count_changed_files(p.install_path or "", local_plugin_dir(m, entry) or "")
+    if n is None:
+        p.note = "installed files could not be compared with the marketplace copy"
+    elif n:
+        p.changed_files, p.note = n, files_differ_note(p, m, n)
     elif m.status == CURRENT:
         p.status = CURRENT
     elif m.status == UPDATE:
@@ -563,7 +575,7 @@ def fix_commands(r: Report) -> list:
         if m.status == UPDATE:
             cmds.append(f"claude plugin marketplace update {shlex.quote(m.name)}")
     for p in r.plugins:
-        if p.status != UPDATE:
+        if p.status != UPDATE and not p.changed_files:
             continue
         pid = shlex.quote(p.id)
         scoped = p.scope in ("project", "local") and p.project_path
@@ -573,7 +585,11 @@ def fix_commands(r: Report) -> list:
             cmd = f"claude plugin uninstall --keep-data{flag} {pid} && claude plugin install{flag} {pid}"
         else:
             cmd = f"claude plugin update {pid}{flag}"
-        cmds.append(f"(cd {shlex.quote(p.project_path)} && {cmd})" if scoped else cmd)
+        if scoped:
+            cmd = f"(cd {shlex.quote(p.project_path)} && {cmd})"
+        if p.changed_files:
+            cmd += "  # replaces the installed files, local edits included"
+        cmds.append(cmd)
     for c in r.stale + r.orphans:
         if c.deletable:
             cmds.append(f"rm -rf {shlex.quote(c.path)}")
@@ -642,9 +658,11 @@ def render(r: Report) -> str:
         if any(p.status == UPDATE for p in r.plugins):
             out.append("Restart Claude Code after `claude plugin update` to load the new version.")
         if any(p.changed_files for p in r.plugins):
-            out.append("A plugin marked \"same version\" changed in its marketplace without a version bump, so "
-                       "`claude plugin update` can report it as current. Its command reinstalls it and keeps its data "
-                       "directory. A version bump by the plugin author fixes it for everyone.")
+            out.append("A row marked \"same version, but N files differ\" is `unknown`: the plugin changed in its "
+                       "marketplace without a version bump, or someone edited the installed copy. The files alone "
+                       "cannot tell which. `claude plugin update` compares versions and can report it as current, "
+                       "so its command reinstalls it from the marketplace copy and keeps its data directory. "
+                       "Skip it if the installed copy holds local edits you want to keep.")
     else:
         out.append("Nothing to fix.")
     busy = [c for c in r.stale + r.orphans if c.in_use]
@@ -771,8 +789,11 @@ def run_self_tests() -> int:
         def install(self, pid, version, scope="user", project=None, sha=None):
             name, market = pid.split("@")
             path = os.path.join(self.pdir, "cache", market, name, version)
-            src = os.path.join(self.pdir, "marketplaces", market, "plugins", name)
-            if os.path.isdir(src):
+            loc = os.path.join(self.pdir, "marketplaces", market)
+            m = Marketplace(market, loc, manifest=read_json(os.path.join(loc, ".claude-plugin", "marketplace.json")))
+            entry = find_entry(m, name)
+            src = local_plugin_dir(m, entry) if entry else None
+            if src and os.path.isdir(src):
                 shutil.copytree(src, path, dirs_exist_ok=True)
             os.makedirs(path, exist_ok=True)
             e = {"id": pid, "version": version, "scope": scope, "enabled": True, "installPath": path,
@@ -886,7 +907,6 @@ def run_self_tests() -> int:
 
         def test_same_version_changed_files(self):
             self.base()
-            head = git("-C", os.path.join(self.f.pdir, "marketplaces", "mkt-a"), "rev-parse", "HEAD")
             self.f.install("alpha@mkt-a", "1.0.0", sha="0" * 40)
             cached = os.path.join(self.f.pdir, "cache", "mkt-a", "alpha", "1.0.0")
             write(os.path.join(cached, ".in_use", "1"), "")
@@ -896,16 +916,13 @@ def run_self_tests() -> int:
             write(os.path.join(cached, "SKILL.md"), "old text")
             r = self.f.report()
             a = self.plugin(r, "alpha@mkt-a")
-            self.assertEqual((a.status, a.changed_files), (UPDATE, 1))
-            self.assertIn("same version, but 1 file differs: the marketplace changed after the install", a.note)
-            self.assertEqual(fix_commands(r), ["claude plugin uninstall --keep-data alpha@mkt-a && claude plugin install alpha@mkt-a"])
-            # Installed from the marketplace's current commit: the difference is local, not an upstream change.
-            self.f.provenance["alpha@mkt-a"][0]["gitCommitSha"] = head
-            r = self.f.report()
-            a = self.plugin(r, "alpha@mkt-a")
-            self.assertEqual(a.status, UNKNOWN)
-            self.assertIn("the cause is not known", a.note)
-            self.assertEqual(fix_commands(r), [])
+            # A local edit and an upstream change look the same, so the status is unknown either way.
+            self.assertEqual((a.status, a.changed_files), (UNKNOWN, 1))
+            self.assertIn("same version, but 1 file differs from the marketplace copy; installed from commit 000000000000", a.note)
+            self.assertEqual(fix_commands(r), ["claude plugin uninstall --keep-data alpha@mkt-a && claude plugin install "
+                                               "alpha@mkt-a  # replaces the installed files, local edits included"])
+            self.assertIn("Skip it if the installed copy holds local edits", render(r))
+            self.assertTrue(r.needs_attention())
 
         def test_unverifiable_files_are_unknown(self):
             self.base()
@@ -929,6 +946,35 @@ def run_self_tests() -> int:
             self.f.plugins[0]["version"] = "nightly-7"
             self.assertIn("cannot be ordered", self.plugin(self.f.report(), "alpha@mkt-a").note)
 
+        def test_scoped_reinstall_command_parses(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0", scope="project", project="/work/my app")
+            write(os.path.join(self.f.pdir, "cache", "mkt-a", "alpha", "1.0.0", "SKILL.md"), "edited")
+            (cmd,) = fix_commands(self.f.report())
+            self.assertEqual(cmd, "(cd '/work/my app' && claude plugin uninstall --keep-data --scope project alpha@mkt-a"
+                                  " && claude plugin install --scope project alpha@mkt-a)"
+                                  "  # replaces the installed files, local edits included")
+            for c in fix_commands(self.f.report()):
+                self.assertEqual(subprocess.run(["sh", "-n", "-c", c]).returncode, 0, c)  # parse only, never run
+
+        def test_path_based_files_are_checked(self):
+            self.base()
+            self.f.install("beta@mkt-b", self.b2[:12])
+            write(os.path.join(self.f.pdir, "cache", "mkt-b", "beta", self.b2[:12], "README.md"), "edited")
+            b = self.plugin(self.f.report(), "beta@mkt-b")
+            self.assertEqual((b.status, b.changed_files), (UNKNOWN, 1))
+            self.f.plugins[0]["installPath"] = os.path.join(self.tmp, "nonexistent")
+            b = self.plugin(self.f.report(), "beta@mkt-b")
+            self.assertEqual(b.status, UNKNOWN)
+            self.assertIn("could not be compared", b.note)
+
+        def test_mixed_timestamp_formats(self):
+            self.base()
+            self.f.install("beta@mkt-b", self.b1[:12])
+            self.f.plugins[0]["lastUpdated"] = "2026-01-01T00:00:00"  # no offset
+            self.assertEqual(self.plugin(self.f.report(), "beta@mkt-b").status, UPDATE)
+            self.assertEqual(parse_time("2026-01-01T00:00:00"), parse_time("2026-01-01T00:00:00.000Z"))
+
         def test_path_based_order_needs_proof(self):
             self.base()
             self.f.install("beta@mkt-b", self.b1[:12])
@@ -936,7 +982,7 @@ def run_self_tests() -> int:
             r = self.f.report()
             b = self.plugin(r, "beta@mkt-b")
             self.assertEqual(b.status, UNKNOWN)
-            self.assertIn("cannot be proved", b.note)
+            self.assertIn("not known to be the later one", b.note)
             self.assertEqual(fix_commands(r), [])
 
         def test_active_cache_dir_is_never_stale(self):

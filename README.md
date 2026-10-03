@@ -39,9 +39,10 @@ The report has:
 The skill never runs those commands. It never fetches, updates, installs or deletes. A cache
 directory that a running session still uses gets no `rm` command.
 
-Semver plugins are compared by version. When the versions match, the installed files are compared
-with the marketplace copy too, which catches a plugin changed without a version bump. Path-based
-plugins, whose version is a 12-character marketplace commit hash, are compared by commit.
+Semver plugins are compared by version. Path-based plugins, whose version is a 12-character
+marketplace commit hash, are compared by commit. When the version or commit matches, the installed
+files are compared with the marketplace copy too. A mismatch is reported as `unknown`: a plugin
+changed without a version bump and a local edit look the same.
 
 The check runs on its own too:
 
