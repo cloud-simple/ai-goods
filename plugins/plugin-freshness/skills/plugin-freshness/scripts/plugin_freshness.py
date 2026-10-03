@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import filecmp
 import json
 import os
 import re
@@ -43,6 +44,9 @@ BUILT_IN_MARKETPLACES = {"anthropic-plugin-directory"}
 # Claude Code writes a 12-character commit hash as the version of a plugin that declares none.
 COMMIT_VERSION = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+# Not plugin content: Claude Code's in-use markers, git metadata and Python bytecode.
+IGNORED_NAMES = {".in_use", ".git", "__pycache__", ".DS_Store"}
 
 CLI_TIMEOUT = 60
 REMOTE_TIMEOUT = 20
@@ -77,10 +81,12 @@ class Plugin:
     scope: str = "user"
     project_path: Optional[str] = None
     enabled: bool = True
+    install_path: Optional[str] = None
     regime: str = ""
     available: Optional[str] = None
     status: str = UNKNOWN
     note: str = ""
+    changed_files: int = 0  # files that differ from the marketplace copy under the same version
 
 
 @dataclass
@@ -289,6 +295,32 @@ def available_version(m: Marketplace, entry: dict) -> Optional[str]:
     return str(entry["version"]) if entry.get("version") else None
 
 
+def plugin_files(root: str) -> dict:
+    out = {}
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in IGNORED_NAMES]
+        for f in files:
+            if f not in IGNORED_NAMES and not f.endswith(".pyc"):
+                full = os.path.join(d, f)
+                out[os.path.relpath(full, root)] = full
+    return out
+
+
+def count_changed_files(installed_dir: str, market_dir: str) -> Optional[int]:
+    """Number of files added, removed or changed between two plugin directories, or None when one is missing."""
+    if not (os.path.isdir(installed_dir) and os.path.isdir(market_dir)):
+        return None
+    a, b = plugin_files(installed_dir), plugin_files(market_dir)
+    changed = len(set(a) ^ set(b))
+    for rel in set(a) & set(b):
+        try:
+            if not filecmp.cmp(a[rel], b[rel], shallow=False):
+                changed += 1
+        except OSError:
+            changed += 1
+    return changed
+
+
 def remote_clause(m: Marketplace) -> str:
     if m.status == UPDATE:
         return "marketplace copy is behind its remote"
@@ -316,6 +348,9 @@ def judge(p: Plugin, markets: dict) -> None:
             p.note = "marketplace copy declares no version"
         elif p.available != p.installed:
             p.status, p.note = UPDATE, "marketplace copy has a different version"
+        elif p.install_path and (n := count_changed_files(p.install_path, local_plugin_dir(m, entry) or "")):
+            p.status, p.changed_files = UPDATE, n
+            p.note = f"same version, but {n} file{' differs' if n == 1 else 's differ'} from the marketplace copy"
         elif m.status == CURRENT:
             p.status = CURRENT
         else:
@@ -349,7 +384,7 @@ def load_plugins(listing: list, markets: dict) -> list:
         name, market = pid.rsplit("@", 1)
         p = Plugin(id=pid, name=name, marketplace=market, installed=str(e.get("version") or ""),
                    scope=e.get("scope", "user"), project_path=e.get("projectPath"),
-                   enabled=bool(e.get("enabled", True)))
+                   enabled=bool(e.get("enabled", True)), install_path=e.get("installPath"))
         judge(p, markets)
         result.append(p)
     return result
@@ -434,9 +469,12 @@ def fix_commands(r: Report) -> list:
         if p.status != UPDATE:
             continue
         if p.scope in ("project", "local") and p.project_path:
-            cmds.append(f"(cd {shlex.quote(p.project_path)} && claude plugin update {shlex.quote(p.id)} --scope {p.scope})")
+            cmd = f"(cd {shlex.quote(p.project_path)} && claude plugin update {shlex.quote(p.id)} --scope {p.scope})"
         else:
-            cmds.append(f"claude plugin update {shlex.quote(p.id)}")
+            cmd = f"claude plugin update {shlex.quote(p.id)}"
+        if p.changed_files:
+            cmd += "  # same version: if this reports no update, reinstall the plugin"
+        cmds.append(cmd)
     for c in r.stale + r.orphans:
         if not c.in_use:
             cmds.append(f"rm -rf {shlex.quote(c.path)}")
@@ -501,6 +539,10 @@ def render(r: Report) -> str:
                        "a refreshed marketplace can change the available versions.")
         if any(p.status == UPDATE for p in r.plugins):
             out.append("Restart Claude Code after `claude plugin update` to load the new version.")
+        if any(p.changed_files for p in r.plugins):
+            out.append("A plugin marked \"same version\" changed upstream without a version bump. "
+                       "`claude plugin update` may treat it as current. Reinstalling it picks up the new files; "
+                       "a version bump by the plugin author fixes it for everyone.")
     busy = [c for c in r.stale + r.orphans if c.in_use]
     if busy:
         out.append(f"{len(busy)} cache director{'y is' if len(busy) == 1 else 'ies are'} still in use by a running "
@@ -622,6 +664,9 @@ def run_self_tests() -> int:
         def install(self, pid, version, scope="user", project=None):
             name, market = pid.split("@")
             path = os.path.join(self.pdir, "cache", market, name, version)
+            src = os.path.join(self.pdir, "marketplaces", market, "plugins", name)
+            if os.path.isdir(src):
+                shutil.copytree(src, path, dirs_exist_ok=True)
             os.makedirs(path, exist_ok=True)
             e = {"id": pid, "version": version, "scope": scope, "enabled": True, "installPath": path}
             if project:
@@ -727,6 +772,23 @@ def run_self_tests() -> int:
             self.assertIn("then this check again", render(r))
 
         # Edge cases.
+
+        def test_same_version_changed_files(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0")
+            cached = os.path.join(self.f.pdir, "cache", "mkt-a", "alpha", "1.0.0")
+            src = os.path.join(self.f.pdir, "marketplaces", "mkt-a", "plugins", "alpha")
+            shutil.copytree(src, cached, dirs_exist_ok=True)
+            write(os.path.join(cached, ".in_use", "1"), "")
+            write(os.path.join(cached, "scripts", "__pycache__", "x.pyc"), "bytecode")
+            r = self.f.report()
+            self.assertEqual(self.plugin(r, "alpha@mkt-a").status, CURRENT)
+            write(os.path.join(cached, "SKILL.md"), "old text")
+            r = self.f.report()
+            a = self.plugin(r, "alpha@mkt-a")
+            self.assertEqual((a.status, a.changed_files), (UPDATE, 1))
+            self.assertIn("same version, but 1 file differs", a.note)
+            self.assertIn("reinstall the plugin", fix_commands(r)[0])
 
         def test_stale_cache_dir_ignores_mtime(self):
             self.base()
