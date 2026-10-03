@@ -63,23 +63,32 @@ A plugin's version string sets how it is judged:
 
 - **Semver plugin** (for example `1.4.2`): the available version comes from the plugin's
   `plugin.json` in the marketplace copy, or from its `marketplace.json` entry when `plugin.json` has
-  none. `plugin.json` wins when both are set. When the versions match, the script also compares the
-  installed files with the marketplace copy: authors sometimes change a plugin without bumping its
-  version, and the row then reads `update available` with "same version, but N files differ". The
-  plugin is `current` only when the versions and files match and the marketplace is current. When
-  they match but the marketplace is behind or unreachable, the status is `unknown`: the newer
-  upstream may carry a new version.
+  none. `plugin.json` wins when both are set. Versions are ordered by SemVer rules. A newer
+  marketplace version is `update available`. An older one, or two versions that cannot be ordered,
+  is `unknown`, so the report never suggests a downgrade.
+- **Same version, different files**: when the versions match, the script compares the installed
+  files with the marketplace copy. Authors sometimes change a plugin without bumping its version.
+  The row reads `update available` only when `installed_plugins.json` shows the plugin came from an
+  older marketplace commit and the marketplace was refreshed after the install. Otherwise the
+  direction is not proved, and the row is `unknown`. The fix is a reinstall with `--keep-data`,
+  because `claude plugin update` compares versions and can report the plugin as current.
 - **Path-based plugin** (a 12-character commit hash, for example `context7` and `skill-creator`):
   Claude Code writes the marketplace commit as the version because no manifest has one. The plugin
-  is `current` only when that commit equals the marketplace's local commit and the marketplace is
-  current. Any newer marketplace commit is a new version.
+  is `current` when that commit equals the marketplace's local commit and the marketplace is current.
+  A different commit is `update available` when the marketplace was refreshed after the install,
+  and `unknown` otherwise: the local copies are shallow, so git history cannot order the commits.
+
+A plugin is `current` only when its version and files match the marketplace copy and the
+marketplace is current. Any check that cannot run gives `unknown`, never `current`.
 
 The cache under `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` is checked too:
 
 - **Stale**: a version directory of an installed plugin that no installation uses.
 - **Orphaned**: a cached plugin that is no longer installed.
+- The directory named by the plugin's `installPath` is never stale.
 - A directory with a live process ID in its `.in_use/` folder is still used by a running session.
-  The script lists it but prints no `rm` command for it.
+  The script lists it but prints no `rm` command for it. It also prints none when the plugin's
+  active version is unknown.
 
 `anthropic-plugin-directory` is built in to Claude Code and has no local copy, so it is not checked.
 

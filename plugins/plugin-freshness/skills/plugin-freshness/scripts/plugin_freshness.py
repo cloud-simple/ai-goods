@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import filecmp
 import json
 import os
@@ -43,6 +44,7 @@ BUILT_IN_MARKETPLACES = {"anthropic-plugin-directory"}
 
 # Claude Code writes a 12-character commit hash as the version of a plugin that declares none.
 COMMIT_VERSION = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
+SEMVER = re.compile(r"v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 # Not plugin content: Claude Code's in-use markers, git metadata and Python bytecode.
@@ -64,6 +66,7 @@ class Marketplace:
     auto_update: Optional[bool] = None
     auto_update_explicit: bool = False
     manifest: Optional[dict] = None
+    last_updated: Optional[str] = None  # when Claude Code last refreshed the local copy
 
     @property
     def status(self) -> str:
@@ -82,6 +85,8 @@ class Plugin:
     project_path: Optional[str] = None
     enabled: bool = True
     install_path: Optional[str] = None
+    last_updated: Optional[str] = None  # when this installation was last installed or updated
+    git_commit_sha: Optional[str] = None  # marketplace commit this installation came from
     regime: str = ""
     available: Optional[str] = None
     status: str = UNKNOWN
@@ -96,6 +101,11 @@ class CacheEntry:
     version: str
     installed: list = field(default_factory=list)
     in_use: list = field(default_factory=list)  # live PIDs from <dir>/.in_use/
+    uncertain: bool = False  # the plugin's active version is unknown, so this directory may be the active one
+
+    @property
+    def deletable(self) -> bool:
+        return not self.in_use and not self.uncertain
 
 
 @dataclass
@@ -156,6 +166,41 @@ def cli_json(cmd: list, override: Optional[str]):
         return json.loads(out)
     except ValueError:
         raise SystemExit(f"error: `{' '.join(cmd)}` did not print JSON")
+
+
+def parse_time(value: Optional[str]) -> Optional[datetime.datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def compare_versions(a: str, b: str) -> Optional[int]:
+    """-1, 0 or 1 by SemVer precedence, or None when either string is not a version."""
+    ma, mb = SEMVER.fullmatch(a), SEMVER.fullmatch(b)
+    if not ma or not mb:
+        return None
+    ca, cb = [int(x) for x in ma.group(1).split(".")], [int(x) for x in mb.group(1).split(".")]
+    width = max(len(ca), len(cb))
+    ca, cb = ca + [0] * (width - len(ca)), cb + [0] * (width - len(cb))
+    if ca != cb:
+        return -1 if ca < cb else 1
+    pa, pb = ma.group(2), mb.group(2)
+    if pa == pb:
+        return 0
+    if pa is None or pb is None:
+        return 1 if pa is None else -1  # a pre-release sorts before its release
+    for x, y in zip(pa.split("."), pb.split(".")):
+        if x == y:
+            continue
+        if x.isdigit() and y.isdigit():
+            return -1 if int(x) < int(y) else 1
+        if x.isdigit() != y.isdigit():
+            return -1 if x.isdigit() else 1
+        return -1 if x < y else 1
+    return (len(pa.split(".")) > len(pb.split("."))) - (len(pa.split(".")) < len(pb.split(".")))
 
 
 def detect_regime(version: Optional[str]) -> str:
@@ -223,7 +268,9 @@ def read_remote_head(m: Marketplace) -> tuple:
         cmd = ["git", "ls-remote", url, ref]
     rc, out, err = run(cmd, REMOTE_TIMEOUT, git_env())
     if rc != 0:
-        return None, f"remote not reachable: {err.strip().splitlines()[-1] if err.strip() else 'no output'}"
+        lines = [x.strip() for x in err.splitlines() if x.strip()]
+        detail = " ".join(lines)[:200] if lines else "no output"
+        return None, f"remote not reachable: {detail}"
     head = parse_ls_remote(out, ref)
     if head is None:
         return None, f"remote has no {ref}"
@@ -241,6 +288,7 @@ def load_marketplaces(listing: list, plugins_dir: str, check_remote: bool) -> li
         location = entry.get("installLocation") or k.get("installLocation") or os.path.join(plugins_dir, "marketplaces", name)
         m = Marketplace(name=name, location=location, source=k.get("source") or {
             key: entry[key] for key in ("source", "repo", "url", "ref") if key in entry})
+        m.last_updated = k.get("lastUpdated")
         if "autoUpdate" in k:
             m.auto_update, m.auto_update_explicit = bool(k["autoUpdate"]), True
         else:
@@ -321,6 +369,12 @@ def count_changed_files(installed_dir: str, market_dir: str) -> Optional[int]:
     return changed
 
 
+def fetched_after_install(p: Plugin, m: Marketplace) -> bool:
+    """True when the marketplace copy was refreshed after this installation, from recorded timestamps."""
+    market, plugin = parse_time(m.last_updated), parse_time(p.last_updated)
+    return bool(market and plugin and market > plugin)
+
+
 def remote_clause(m: Marketplace) -> str:
     if m.status == UPDATE:
         return "marketplace copy is behind its remote"
@@ -346,15 +400,31 @@ def judge(p: Plugin, markets: dict) -> None:
         p.available = available_version(m, entry)
         if p.available is None:
             p.note = "marketplace copy declares no version"
-        elif p.available != p.installed:
-            p.status, p.note = UPDATE, "marketplace copy has a different version"
-        elif p.install_path and (n := count_changed_files(p.install_path, local_plugin_dir(m, entry) or "")):
-            p.status, p.changed_files = UPDATE, n
-            p.note = f"same version, but {n} file{' differs' if n == 1 else 's differ'} from the marketplace copy"
+            return
+        order = 0 if p.available == p.installed else compare_versions(p.installed, p.available)
+        if order is None:
+            p.note = "versions differ and cannot be ordered"
+            return
+        if order > 0:
+            p.note = "installed version is newer than the marketplace copy"
+            return
+        if order < 0:
+            p.status, p.note = UPDATE, "marketplace copy has a newer version"
+            return
+        n = count_changed_files(p.install_path or "", local_plugin_dir(m, entry) or "")
+        if n is None:
+            p.note = "installed files could not be compared with the marketplace copy"
+        elif n:
+            files = f"{n} file{' differs' if n == 1 else 's differ'}"
+            if p.git_commit_sha and m.local_head and p.git_commit_sha != m.local_head and fetched_after_install(p, m):
+                p.status, p.changed_files = UPDATE, n
+                p.note = f"same version, but {files}: the marketplace changed after the install without a version bump"
+            else:
+                p.note = f"same version, but {files} between the installed copy and the marketplace copy; the cause is not known"
         elif m.status == CURRENT:
             p.status = CURRENT
         else:
-            p.note = f"same version locally; {remote_clause(m)}"
+            p.note = f"same version and files locally; {remote_clause(m)}"
         return
 
     # Path-based: the version is the marketplace commit the plugin was installed from.
@@ -366,7 +436,10 @@ def judge(p: Plugin, markets: dict) -> None:
         return
     p.available = m.local_head[:len(p.installed)]
     if p.available != p.installed:
-        p.status, p.note = UPDATE, "marketplace copy is at a newer commit"
+        if fetched_after_install(p, m):
+            p.status, p.note = UPDATE, "marketplace copy was refreshed after the install and is at another commit"
+        else:
+            p.note = "commits differ, and which one is newer cannot be proved"
     elif m.status == CURRENT:
         p.status = CURRENT
     elif m.status == UPDATE:
@@ -375,7 +448,19 @@ def judge(p: Plugin, markets: dict) -> None:
         p.note = remote_clause(m)
 
 
-def load_plugins(listing: list, markets: dict) -> list:
+def load_provenance(plugins_dir: str) -> dict:
+    """installPath -> gitCommitSha from installed_plugins.json. The CLI listing does not carry the commit."""
+    data = read_json(os.path.join(plugins_dir, "installed_plugins.json")) or {}
+    out = {}
+    for entries in (data.get("plugins") or {}).values():
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, dict) and e.get("installPath") and e.get("gitCommitSha"):
+                out[os.path.realpath(e["installPath"])] = e["gitCommitSha"]
+    return out
+
+
+def load_plugins(listing: list, markets: dict, provenance: Optional[dict] = None) -> list:
+    provenance = provenance or {}
     result = []
     for e in listing:
         pid = e.get("id", "")
@@ -384,7 +469,10 @@ def load_plugins(listing: list, markets: dict) -> list:
         name, market = pid.rsplit("@", 1)
         p = Plugin(id=pid, name=name, marketplace=market, installed=str(e.get("version") or ""),
                    scope=e.get("scope", "user"), project_path=e.get("projectPath"),
-                   enabled=bool(e.get("enabled", True)), install_path=e.get("installPath"))
+                   enabled=bool(e.get("enabled", True)), install_path=e.get("installPath"),
+                   last_updated=e.get("lastUpdated") or e.get("installedAt"))
+        if p.install_path:
+            p.git_commit_sha = provenance.get(os.path.realpath(p.install_path))
         judge(p, markets)
         result.append(p)
     return result
@@ -424,10 +512,18 @@ def live_users(path: str) -> list:
 def scan_cache(plugins_dir: str, plugins: list) -> tuple:
     """Stale: a version directory of an installed plugin that no installation uses.
     Orphan: a cached plugin with no installation at all. Directory mtimes are never read."""
-    installed: dict = {}
-    for p in plugins:
-        installed.setdefault((p.marketplace, p.name), set()).add(p.installed)
     root = os.path.join(plugins_dir, "cache")
+    installed: dict = {}
+    uncertain = set()
+    for p in plugins:
+        versions = installed.setdefault((p.marketplace, p.name), set())
+        if p.installed:
+            versions.add(p.installed)
+        if p.install_path:
+            # The directory the CLI says is active is never stale, whatever its name.
+            versions.add(os.path.basename(os.path.normpath(p.install_path)))
+        elif detect_regime(p.installed) == "none":
+            uncertain.add((p.marketplace, p.name))
     stale, orphans = [], []
     for market in list_dirs(root):
         for name in list_dirs(os.path.join(root, market)):
@@ -438,6 +534,7 @@ def scan_cache(plugins_dir: str, plugins: list) -> tuple:
                 if versions is None:
                     orphans.append(entry)
                 elif ver not in versions:
+                    entry.uncertain = (market, name) in uncertain
                     stale.append(entry)
     return stale, orphans
 
@@ -447,7 +544,7 @@ def scan_cache(plugins_dir: str, plugins: list) -> tuple:
 def build_report(plugins_dir: str, plugin_list: list, market_list: list, check_remote: bool) -> Report:
     markets = load_marketplaces(market_list, plugins_dir, check_remote)
     by_name = {m.name: m for m in markets}
-    plugins = load_plugins(plugin_list, by_name)
+    plugins = load_plugins(plugin_list, by_name, load_provenance(plugins_dir))
     stale, orphans = scan_cache(plugins_dir, plugins)
     skipped = sorted(BUILT_IN_MARKETPLACES - set(by_name))
     for p in plugins:
@@ -468,15 +565,17 @@ def fix_commands(r: Report) -> list:
     for p in r.plugins:
         if p.status != UPDATE:
             continue
-        if p.scope in ("project", "local") and p.project_path:
-            cmd = f"(cd {shlex.quote(p.project_path)} && claude plugin update {shlex.quote(p.id)} --scope {p.scope})"
-        else:
-            cmd = f"claude plugin update {shlex.quote(p.id)}"
+        pid = shlex.quote(p.id)
+        scoped = p.scope in ("project", "local") and p.project_path
+        flag = f" --scope {p.scope}" if scoped else ""
         if p.changed_files:
-            cmd += "  # same version: if this reports no update, reinstall the plugin"
-        cmds.append(cmd)
+            # The version did not change, so `claude plugin update` can report it as current. Reinstall instead.
+            cmd = f"claude plugin uninstall --keep-data{flag} {pid} && claude plugin install{flag} {pid}"
+        else:
+            cmd = f"claude plugin update {pid}{flag}"
+        cmds.append(f"(cd {shlex.quote(p.project_path)} && {cmd})" if scoped else cmd)
     for c in r.stale + r.orphans:
-        if not c.in_use:
+        if c.deletable:
             cmds.append(f"rm -rf {shlex.quote(c.path)}")
     return cmds
 
@@ -486,9 +585,12 @@ def cell(s) -> str:
 
 
 def in_use_note(c: CacheEntry) -> str:
-    if not c.in_use:
-        return ""
-    return f"; in use by running session PID {', '.join(map(str, c.in_use))}"
+    notes = []
+    if c.in_use:
+        notes.append(f"in use by running session PID {', '.join(map(str, c.in_use))}")
+    if c.uncertain:
+        notes.append("the active version is unknown, so this may be the active directory")
+    return "".join(f"; {n}" for n in notes)
 
 
 def render(r: Report) -> str:
@@ -514,7 +616,7 @@ def render(r: Report) -> str:
                    f"{cell(p.marketplace)} | {p.status} | {cell(note)} |")
 
     out += ["", "## Stale cache directories", ""]
-    out += [f"- `{c.path}` (installed: {', '.join(c.installed)}){in_use_note(c)}" for c in r.stale] or ["None."]
+    out += [f"- `{c.path}` (installed: {', '.join(c.installed) or 'unknown'}){in_use_note(c)}" for c in r.stale] or ["None."]
     out += ["", "## Orphaned cache entries", ""]
     out += [f"- `{c.path}` ({c.plugin_id} is not installed){in_use_note(c)}" for c in r.orphans] or ["None."]
 
@@ -540,15 +642,19 @@ def render(r: Report) -> str:
         if any(p.status == UPDATE for p in r.plugins):
             out.append("Restart Claude Code after `claude plugin update` to load the new version.")
         if any(p.changed_files for p in r.plugins):
-            out.append("A plugin marked \"same version\" changed upstream without a version bump. "
-                       "`claude plugin update` may treat it as current. Reinstalling it picks up the new files; "
-                       "a version bump by the plugin author fixes it for everyone.")
+            out.append("A plugin marked \"same version\" changed in its marketplace without a version bump, so "
+                       "`claude plugin update` can report it as current. Its command reinstalls it and keeps its data "
+                       "directory. A version bump by the plugin author fixes it for everyone.")
+    else:
+        out.append("Nothing to fix.")
     busy = [c for c in r.stale + r.orphans if c.in_use]
     if busy:
         out.append(f"{len(busy)} cache director{'y is' if len(busy) == 1 else 'ies are'} still in use by a running "
                    "session and left out of the commands. Close those sessions and run this check again.")
-    else:
-        out.append("Nothing to fix.")
+    unsure = [c for c in r.stale if c.uncertain and not c.in_use]
+    if unsure:
+        out.append(f"{len(unsure)} cache director{'y is' if len(unsure) == 1 else 'ies are'} left out of the commands "
+                   "because the plugin's active version is unknown.")
     if off:
         out.append("To turn on auto-update for a marketplace: `/plugin` > Marketplaces > select it > Enable auto-update.")
     return "\n".join(out) + "\n"
@@ -626,7 +732,7 @@ def run_self_tests() -> int:
             self.tmp = tmp
             self.pdir = os.path.join(tmp, "plugins")
             self.up = os.path.join(tmp, "upstream")
-            self.plugins, self.markets, self.known = [], [], {}
+            self.plugins, self.markets, self.known, self.provenance = [], [], {}, {}
 
         def upstream(self, name, files: dict) -> str:
             repo = os.path.join(self.up, name)
@@ -657,21 +763,25 @@ def run_self_tests() -> int:
         def register(self, name, source, auto):
             loc = os.path.join(self.pdir, "marketplaces", name)
             self.markets.append({"name": name, "source": source["source"], "installLocation": loc})
-            self.known[name] = {"source": source, "installLocation": loc}
+            # Refreshed after every fixture install unless a test says otherwise.
+            self.known[name] = {"source": source, "installLocation": loc, "lastUpdated": "2026-01-02T00:00:00.000Z"}
             if auto is not None:
                 self.known[name]["autoUpdate"] = auto
 
-        def install(self, pid, version, scope="user", project=None):
+        def install(self, pid, version, scope="user", project=None, sha=None):
             name, market = pid.split("@")
             path = os.path.join(self.pdir, "cache", market, name, version)
             src = os.path.join(self.pdir, "marketplaces", market, "plugins", name)
             if os.path.isdir(src):
                 shutil.copytree(src, path, dirs_exist_ok=True)
             os.makedirs(path, exist_ok=True)
-            e = {"id": pid, "version": version, "scope": scope, "enabled": True, "installPath": path}
+            e = {"id": pid, "version": version, "scope": scope, "enabled": True, "installPath": path,
+                 "lastUpdated": "2026-01-01T00:00:00.000Z"}
             if project:
                 e["projectPath"] = project
             self.plugins.append(e)
+            if sha:
+                self.provenance.setdefault(pid, []).append({"installPath": path, "version": version, "gitCommitSha": sha})
 
         def cache_dir(self, market, name, version) -> str:
             path = os.path.join(self.pdir, "cache", market, name, version)
@@ -680,6 +790,7 @@ def run_self_tests() -> int:
 
         def report(self, check_remote=True) -> Report:
             write(os.path.join(self.pdir, "known_marketplaces.json"), self.known)
+            write(os.path.join(self.pdir, "installed_plugins.json"), {"version": 2, "plugins": self.provenance})
             return build_report(self.pdir, self.plugins, self.markets, check_remote)
 
     def mkt(*plugins) -> dict:
@@ -775,20 +886,91 @@ def run_self_tests() -> int:
 
         def test_same_version_changed_files(self):
             self.base()
-            self.f.install("alpha@mkt-a", "1.0.0")
+            head = git("-C", os.path.join(self.f.pdir, "marketplaces", "mkt-a"), "rev-parse", "HEAD")
+            self.f.install("alpha@mkt-a", "1.0.0", sha="0" * 40)
             cached = os.path.join(self.f.pdir, "cache", "mkt-a", "alpha", "1.0.0")
-            src = os.path.join(self.f.pdir, "marketplaces", "mkt-a", "plugins", "alpha")
-            shutil.copytree(src, cached, dirs_exist_ok=True)
             write(os.path.join(cached, ".in_use", "1"), "")
             write(os.path.join(cached, "scripts", "__pycache__", "x.pyc"), "bytecode")
             r = self.f.report()
-            self.assertEqual(self.plugin(r, "alpha@mkt-a").status, CURRENT)
+            self.assertEqual(self.plugin(r, "alpha@mkt-a").status, CURRENT)  # ignored names do not count
             write(os.path.join(cached, "SKILL.md"), "old text")
             r = self.f.report()
             a = self.plugin(r, "alpha@mkt-a")
             self.assertEqual((a.status, a.changed_files), (UPDATE, 1))
-            self.assertIn("same version, but 1 file differs", a.note)
-            self.assertIn("reinstall the plugin", fix_commands(r)[0])
+            self.assertIn("same version, but 1 file differs: the marketplace changed after the install", a.note)
+            self.assertEqual(fix_commands(r), ["claude plugin uninstall --keep-data alpha@mkt-a && claude plugin install alpha@mkt-a"])
+            # Installed from the marketplace's current commit: the difference is local, not an upstream change.
+            self.f.provenance["alpha@mkt-a"][0]["gitCommitSha"] = head
+            r = self.f.report()
+            a = self.plugin(r, "alpha@mkt-a")
+            self.assertEqual(a.status, UNKNOWN)
+            self.assertIn("the cause is not known", a.note)
+            self.assertEqual(fix_commands(r), [])
+
+        def test_unverifiable_files_are_unknown(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0")
+            self.f.plugins[0]["installPath"] = os.path.join(self.tmp, "nonexistent")
+            r = self.f.report()
+            a = self.plugin(r, "alpha@mkt-a")
+            self.assertEqual(a.status, UNKNOWN)
+            self.assertIn("could not be compared", a.note)
+            del self.f.plugins[0]["installPath"]
+            self.assertEqual(self.plugin(self.f.report(), "alpha@mkt-a").status, UNKNOWN)
+
+        def test_newer_installed_version_is_not_an_update(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "2.0.0")
+            r = self.f.report()
+            a = self.plugin(r, "alpha@mkt-a")
+            self.assertEqual(a.status, UNKNOWN)
+            self.assertIn("installed version is newer", a.note)
+            self.assertEqual(fix_commands(r), [])
+            self.f.plugins[0]["version"] = "nightly-7"
+            self.assertIn("cannot be ordered", self.plugin(self.f.report(), "alpha@mkt-a").note)
+
+        def test_path_based_order_needs_proof(self):
+            self.base()
+            self.f.install("beta@mkt-b", self.b1[:12])
+            self.f.known["mkt-b"]["lastUpdated"] = "2025-12-31T00:00:00.000Z"  # refreshed before the install
+            r = self.f.report()
+            b = self.plugin(r, "beta@mkt-b")
+            self.assertEqual(b.status, UNKNOWN)
+            self.assertIn("cannot be proved", b.note)
+            self.assertEqual(fix_commands(r), [])
+
+        def test_active_cache_dir_is_never_stale(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "1.0.0")
+            self.f.plugins[0]["version"] = ""  # the CLI still names the active directory
+            other = self.f.cache_dir("mkt-a", "alpha", "0.9.0")
+            r = self.f.report()
+            self.assertEqual([c.path for c in r.stale], [other])
+            # No version and no installPath: the active directory is unknown, so nothing gets an rm line.
+            del self.f.plugins[0]["installPath"]
+            r = self.f.report()
+            self.assertEqual(len(r.stale), 2)
+            self.assertTrue(all(c.uncertain for c in r.stale))
+            self.assertFalse(any(c.startswith("rm ") for c in fix_commands(r)))
+            self.assertIn("may be the active directory", render(r))
+
+        def test_nothing_to_fix_only_without_commands(self):
+            self.base()
+            self.f.install("alpha@mkt-a", "0.9.0")
+            text = render(self.f.report())
+            self.assertIn("```bash", text)
+            self.assertNotIn("Nothing to fix.", text)
+
+        def test_compare_versions(self):
+            self.assertEqual(compare_versions("1.0.0", "1.0.1"), -1)
+            self.assertEqual(compare_versions("1.10.0", "1.9.9"), 1)
+            self.assertEqual(compare_versions("1.0", "1.0.0"), 0)
+            self.assertEqual(compare_versions("v2.0.0", "2.0.0"), 0)
+            self.assertEqual(compare_versions("1.0.0-beta.2", "1.0.0"), -1)
+            self.assertEqual(compare_versions("1.0.0-beta.2", "1.0.0-beta.10"), -1)
+            self.assertEqual(compare_versions("1.0.0-alpha", "1.0.0-alpha.1"), -1)
+            self.assertEqual(compare_versions("1.0.0+build.5", "1.0.0"), 0)
+            self.assertIsNone(compare_versions("nightly", "1.0.0"))
 
         def test_stale_cache_dir_ignores_mtime(self):
             self.base()
@@ -837,6 +1019,7 @@ def run_self_tests() -> int:
             m = self.market(r, "mkt-a")
             self.assertEqual(m.status, UNKNOWN)
             self.assertIn("remote not reachable", m.problem)
+            self.assertIn("nowhere", m.problem)  # the whole git error, not only its last line
             self.assertEqual(self.plugin(r, "alpha@mkt-a").status, UNKNOWN)
 
         def test_no_remote_flag(self):
