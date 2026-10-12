@@ -11,7 +11,7 @@ Updating is a separate step that the user takes.
 ## Run the check
 
 ```bash
-python3 <this skill's base directory>/scripts/plugin_freshness.py
+python3 "${CLAUDE_SKILL_DIR}/scripts/plugin_freshness.py"
 ```
 
 It takes about 5 seconds. It runs `claude plugin list --json`, `claude plugin marketplace list --json`

@@ -1,7 +1,7 @@
 {
   "name": "plugin-freshness",
   "description": "Read-only check of whether Claude Code plugins and marketplaces are current: installed vs marketplace copy vs git remote, stale and orphaned cache directories, auto-update settings, and the commands to fix what it finds",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "cloud-simple"
   },
