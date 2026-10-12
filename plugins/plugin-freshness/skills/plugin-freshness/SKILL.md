@@ -11,11 +11,25 @@ Updating is a separate step that the user takes.
 ## Run the check
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/plugin_freshness.py"
+python3 "${CLAUDE_SKILL_DIR}/scripts/plugin_freshness.py" --show
 ```
 
 It takes about 5 seconds. It runs `claude plugin list --json`, `claude plugin marketplace list --json`
 and one `git ls-remote` per marketplace, in parallel.
+
+`--show` also opens the report as a page over this session when it runs inside agterm and agterm can
+show HTML. The page has the same content as the Markdown, with rendered tables. The script decides this
+itself, and the last line of its output says what happened:
+
+- `[agterm overlay] shown: <file>`: the page is open on this session and agterm reports it loaded.
+  When the line adds "the user may not see it yet", it names why: this session is not the selected
+  one in its window, or its window is not the frontmost or is minimized.
+- `[agterm overlay] not shown: <reason>`: no confirmed page, so the reply carries the Markdown report.
+  For example: outside agterm, or the session's overlay slot already held another page, a program or a
+  HUD. The script checks the slot first and leaves those alone. It cannot rule out something taking the
+  slot in the moment between its check and the open. Two reasons leave a page behind: a page that
+  failed to load keeps its error panel, and a page not confirmed within 5 seconds stays and may still
+  load.
 
 | Exit code | Meaning |
 |---|---|
@@ -30,10 +44,19 @@ then `unknown`.
 
 1. Lead with one sentence of counts: how many plugins are current, how many have an update, how many
    are `unknown`, and how many cache directories are stale or orphaned.
-2. Paste the script's output into your reply as Markdown, unchanged. It holds a marketplace table, a
-   plugin table, stale cache directories, orphaned cache entries, marketplaces with auto-update off,
-   what was not checked, and the commands to fix. Do not wrap the whole output in a code block: a code
-   block shows the tables as raw `|` text. The fix commands already sit in their own `bash` block.
+2. Show the details. Which way depends on the last output line:
+   - **`shown`**: the full report is on the page. Say it is open in the agterm overlay of this
+     session, and that ⌘W closes it. When the line says the user may not see it yet, pass on the
+     reason it gives, so the user knows to switch to this session or bring its window to the front. Do
+     not repeat the tables in the reply. Give only the rows that are not `current`, and the `bash`
+     block of fix commands, so the user can copy them from the reply.
+   - **`not shown`**, or no such line: paste the script's output into your reply as Markdown,
+     unchanged, without the `[agterm overlay]` line. It holds a marketplace table, a plugin table,
+     stale cache directories, orphaned cache entries, marketplaces with auto-update off, what was not
+     checked, and the commands to fix. Do not wrap the whole output in a code block: a code block shows
+     the tables as raw `|` text. The fix commands already sit in their own `bash` block. Mention the
+     reason only when the user expected the page, or when it says a page stays in the overlay; then
+     add that ⌘W closes it.
 3. Explain each `unknown` row with the note the script gives. Do not replace `unknown` with a guess.
 
 ## Rules
