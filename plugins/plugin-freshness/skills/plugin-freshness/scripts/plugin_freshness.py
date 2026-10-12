@@ -950,13 +950,41 @@ def show_in_agterm(page: str) -> tuple:
         h = our_page(node, path)
         state = (h or {}).get("state")
         if state == "loaded":
-            where = "" if node.get("active") else " (on this session, which is not the one selected in agterm)"
-            return True, path + where
+            return True, path + visibility_note(node, args)
         if state == "failed":
-            return False, f"the page failed to load: {h.get('error') or 'no error given'}"
+            return False, ("the page failed to load, and its error panel stays in the overlay until closed: "
+                           f"{h.get('error') or 'no error given'}")
         if time.monotonic() >= deadline:
-            return False, ("the page did not finish loading" if h else "the page did not appear in the overlay slot")
+            if h:
+                return False, (f"the page was not confirmed loaded within {AGTERM_LOAD_WAIT:g} s; "
+                               "it stays in the overlay and may still load")
+            return False, "the page did not appear in the overlay slot"
         time.sleep(AGTERM_POLL)
+
+
+def visibility_note(node: dict, args: list) -> str:
+    """Say why the user may not see the page yet. A session node's `active` means selected within its
+    own window; `window list` says whether that window is the frontmost one."""
+    notes = []
+    if not node.get("active"):
+        notes.append("it is not the selected session in its window")
+    wid = os.environ.get("AGTERM_WINDOW_ID", "").lower()
+    if wid:
+        rc, out, _ = run(["agtermctl", "window", "list", "--json"] + args[-2:], AGTERM_TIMEOUT)
+        try:
+            data = json.loads(out) if rc == 0 else None
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            data = (data.get("result") or {}).get("windows", data.get("windows"))
+        window = next((w for w in data or [] if isinstance(w, dict) and str(w.get("id", "")).lower() == wid), None)
+        if window is not None and window.get("minimized"):
+            notes.append("its window is minimized")
+        elif window is not None and not window.get("active"):
+            notes.append("its window is not the frontmost")
+    if not notes:
+        return ""
+    return f" (open on this session, but the user may not see it yet: {'; '.join(notes)})"
 
 
 # ---------------------------------------------------------------- main
@@ -1519,7 +1547,7 @@ def run_self_tests() -> int:
             self.assertIn("<li><code>c&lt;d&gt;</code> &amp; e</li>", out)
             self.assertIn("<pre><code>rm -rf &#x27;&lt;p&gt;&#x27;</code></pre>", out)
 
-        def fake_agterm(self, tree=None, html=True, after=None, tree_fails=False):
+        def fake_agterm(self, tree=None, html=True, after=None, tree_fails=False, windows=None):
             """Put a fake agtermctl first on PATH. It logs each call and answers help and tree.
 
             `after` is the tree it answers once an overlay open or reload has run, which is how a test
@@ -1529,6 +1557,9 @@ def run_self_tests() -> int:
             log = os.path.join(self.tmp, "agtermctl.log")
             tree_file, after_file = os.path.join(self.tmp, "tree.json"), os.path.join(self.tmp, "tree-after.json")
             write(tree_file, tree if tree is not None else {})
+            windows_file = os.path.join(self.tmp, "windows.json")
+            write(windows_file, {"result": {"windows": windows if windows is not None
+                                            else [{"id": "WIN-1", "active": True, "minimized": False}]}})
             if after is not None:
                 write(after_file, after)
             elif os.path.exists(after_file):
@@ -1541,6 +1572,7 @@ def run_self_tests() -> int:
                           'case "$*" in\n'
                           f'  *--help*) echo "{help_text}";;\n'
                           f'  tree*) {tree_cmd};;\n'
+                          f'  "window list"*) cat "{windows_file}";;\n'
                           f'  "session overlay open"*|"session overlay reload"*)\n'
                           f'    [ -f "{after_file}" ] && cp "{after_file}" "{tree_file}"; echo ok;;\n'
                           '  *) echo ok;;\n'
@@ -1600,9 +1632,11 @@ def run_self_tests() -> int:
 
         def test_show_counts_only_a_loaded_page(self):
             env, log = self.fake_agterm(self.node(), after=self.loaded("failed", error="boom"))
-            self.assertEqual(self.show(env), (False, "the page failed to load: boom"))
+            self.assertEqual(self.show(env), (False, "the page failed to load, and its error panel stays in the "
+                                                     "overlay until closed: boom"))
             env, log = self.fake_agterm(self.node(), after=self.loaded("loading"))
-            self.assertEqual(self.show(env, wait=0.3), (False, "the page did not finish loading"))
+            self.assertEqual(self.show(env, wait=0.3), (False, "the page was not confirmed loaded within 0.3 s; "
+                                                               "it stays in the overlay and may still load"))
             env, log = self.fake_agterm(self.node(), after=self.node())
             self.assertEqual(self.show(env, wait=0.3), (False, "the page did not appear in the overlay slot"))
             after = self.loaded()
@@ -1610,7 +1644,20 @@ def run_self_tests() -> int:
             env, log = self.fake_agterm(self.node(), after=after)
             shown, detail = self.show(env)
             self.assertTrue(shown)
-            self.assertIn("not the one selected in agterm", detail)
+            self.assertIn("the user may not see it yet: it is not the selected session in its window", detail)
+
+        def test_show_says_when_the_window_is_not_in_front(self):
+            # The session is selected in its window, but that window is behind another one.
+            env, log = self.fake_agterm(self.node(), after=self.loaded(),
+                                        windows=[{"id": "WIN-1", "active": False}, {"id": "WIN-2", "active": True}])
+            shown, detail = self.show(env)
+            self.assertTrue(shown)
+            self.assertEqual(detail, self.page_path() + " (open on this session, but the user may not see it "
+                                                        "yet: its window is not the frontmost)")
+            self.assertIn("window list --json --socket /tmp/fake.sock", self.calls(log))
+            env, log = self.fake_agterm(self.node(), after=self.loaded(),
+                                        windows=[{"id": "win-1", "active": True, "minimized": True}])
+            self.assertIn("its window is minimized", self.show(env)[1])
 
         def test_show_leaves_a_busy_slot_alone(self):
             for fields in ({"overlay": True},
