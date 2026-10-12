@@ -35,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
@@ -816,12 +817,22 @@ def render_html(r: Report, md: str) -> str:
 
 
 def write_private(path: str, text: str) -> None:
-    """Write a file readable only by this user, replacing it in one step."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """Write a file readable only by this user, replacing it in one step.
+
+    mkstemp creates a new mode-0600 file under an unpredictable name and refuses to follow a link,
+    so nothing planted in the directory beforehand is written through or changes the mode."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------- agterm page
@@ -869,38 +880,83 @@ def same_file(reported: Optional[str], path: str) -> bool:
     return os.path.realpath(reported) == os.path.realpath(path)
 
 
-def show_in_agterm(page: str) -> tuple:
-    """Open the page over this agterm session. Return (shown, file path or the reason it was not shown).
+AGTERM_LOAD_WAIT = 5.0  # seconds to wait for the page to report loaded
+AGTERM_POLL = 0.25
 
-    Never takes the slot from something else: a page from another tool, a running program or a HUD
-    stays, and the caller falls back to Markdown. Never switches the user to this session."""
+
+def agterm_error(out: str, err: str) -> str:
+    return (err or out).strip().splitlines()[-1] if (err or out).strip() else "no output"
+
+
+def read_session(sid: str, args: list) -> tuple:
+    """Return (session node or None, reason when None)."""
+    rc, out, err = run(["agtermctl", "tree", "--json"] + args, AGTERM_TIMEOUT)
+    if rc != 0:
+        return None, f"agtermctl tree failed: {agterm_error(out, err)}"
+    try:
+        node = find_session(json.loads(out), sid)
+    except ValueError:
+        return None, "agtermctl tree did not print JSON"
+    return (node, "") if node is not None else (None, "this session is not in the agterm tree")
+
+
+def our_page(node: dict, path: str) -> Optional[dict]:
+    for h in node.get("htmlOverlays") or []:
+        if isinstance(h, dict) and not h.get("pane") and same_file(h.get("file"), path):
+            return h
+    return None
+
+
+def show_in_agterm(page: str) -> tuple:
+    """Open the page over this agterm session. Return (shown, detail): the file path, or the reason
+    it was not shown.
+
+    Leaves the slot alone when it holds a page from another tool, a running program or a HUD, so the
+    caller falls back to Markdown. The check and the open are two agtermctl calls, so something that
+    takes the slot in between can still be replaced; agtermctl has no "open only if empty".
+    Never switches the user to this session. Counts the page as shown only once agterm reports it
+    loaded."""
     reason = agterm_unavailable()
     if reason:
         return False, reason
     sid = os.environ["AGTERM_SESSION_ID"]
-    base = ["--socket", os.environ["AGTERM_SOCKET"]]
-    window = ["--window", os.environ["AGTERM_WINDOW_ID"]] if os.environ.get("AGTERM_WINDOW_ID") else []
-    rc, out, err = run(["agtermctl", "tree", "--json"] + window + base, AGTERM_TIMEOUT)
-    try:
-        node = find_session(json.loads(out), sid) if rc == 0 else None
-    except ValueError:
-        node = None
+    # The same window and socket on every call: without --window, agtermctl acts on the frontmost
+    # window, which need not hold this session.
+    args = (["--window", os.environ["AGTERM_WINDOW_ID"]] if os.environ.get("AGTERM_WINDOW_ID") else []) \
+        + ["--socket", os.environ["AGTERM_SOCKET"]]
+    node, reason = read_session(sid, args)
     if node is None:
-        return False, "this session is not in the agterm tree"
+        return False, reason
     path = agterm_page_path(sid)
-    pages = [h for h in (node.get("htmlOverlays") or []) if isinstance(h, dict) and not h.get("pane")]
-    ours = any(same_file(h.get("file"), path) for h in pages)
-    if not ours and (pages or node.get("overlay") or node.get("hud")):
+    ours = our_page(node, path) is not None
+    other = any(isinstance(h, dict) and not h.get("pane") for h in node.get("htmlOverlays") or [])
+    if not ours and (other or node.get("overlay") or node.get("hud")):
         return False, "the session's overlay slot is in use"
     try:
         write_private(path, page)
     except OSError as e:
         return False, f"cannot write {path}: {e}"
     verb = ["reload"] if ours else ["open", "--html", path]
-    rc, out, err = run(["agtermctl", "session", "overlay"] + verb + ["--target", sid] + base, AGTERM_TIMEOUT)
+    rc, out, err = run(["agtermctl", "session", "overlay"] + verb + ["--target", sid] + args, AGTERM_TIMEOUT)
     if rc != 0:
-        return False, f"agtermctl failed: {(err or out).strip() or 'no output'}"
-    return True, path
+        return False, f"agtermctl failed: {agterm_error(out, err)}"
+
+    # A zero exit means agterm accepted the page, not that it loaded.
+    deadline = time.monotonic() + AGTERM_LOAD_WAIT
+    while True:
+        node, reason = read_session(sid, args)
+        if node is None:
+            return False, reason
+        h = our_page(node, path)
+        state = (h or {}).get("state")
+        if state == "loaded":
+            where = "" if node.get("active") else " (on this session, which is not the one selected in agterm)"
+            return True, path + where
+        if state == "failed":
+            return False, f"the page failed to load: {h.get('error') or 'no error given'}"
+        if time.monotonic() >= deadline:
+            return False, ("the page did not finish loading" if h else "the page did not appear in the overlay slot")
+        time.sleep(AGTERM_POLL)
 
 
 # ---------------------------------------------------------------- main
@@ -1463,19 +1519,30 @@ def run_self_tests() -> int:
             self.assertIn("<li><code>c&lt;d&gt;</code> &amp; e</li>", out)
             self.assertIn("<pre><code>rm -rf &#x27;&lt;p&gt;&#x27;</code></pre>", out)
 
-        def fake_agterm(self, tree=None, html=True):
-            """Put a fake agtermctl first on PATH. It logs each call and answers help, tree and the rest."""
+        def fake_agterm(self, tree=None, html=True, after=None, tree_fails=False):
+            """Put a fake agtermctl first on PATH. It logs each call and answers help and tree.
+
+            `after` is the tree it answers once an overlay open or reload has run, which is how a test
+            makes the page load, fail or never appear. `tree_fails` makes tree exit 1."""
             bin_dir = os.path.join(self.tmp, "bin")
             os.makedirs(bin_dir, exist_ok=True)
-            log, tree_file = os.path.join(self.tmp, "agtermctl.log"), os.path.join(self.tmp, "tree.json")
+            log = os.path.join(self.tmp, "agtermctl.log")
+            tree_file, after_file = os.path.join(self.tmp, "tree.json"), os.path.join(self.tmp, "tree-after.json")
             write(tree_file, tree if tree is not None else {})
-            script = os.path.join(bin_dir, "agtermctl")
+            if after is not None:
+                write(after_file, after)
+            elif os.path.exists(after_file):
+                os.remove(after_file)
             help_text = "  --html <html>  Show this local HTML file" if html else "usage"
+            tree_cmd = 'echo "Operation not permitted" >&2; exit 1' if tree_fails else f'cat "{tree_file}"'
+            script = os.path.join(bin_dir, "agtermctl")
             write(script, "#!/bin/sh\n"
                           f'echo "$*" >> "{log}"\n'
                           'case "$*" in\n'
                           f'  *--help*) echo "{help_text}";;\n'
-                          f'  tree*) cat "{tree_file}";;\n'
+                          f'  tree*) {tree_cmd};;\n'
+                          f'  "session overlay open"*|"session overlay reload"*)\n'
+                          f'    [ -f "{after_file}" ] && cp "{after_file}" "{tree_file}"; echo ok;;\n'
                           '  *) echo ok;;\n'
                           'esac\n')
             os.chmod(script, 0o755)
@@ -1486,17 +1553,24 @@ def run_self_tests() -> int:
         def calls(self, log):
             return open(log).read().splitlines() if os.path.exists(log) else []
 
-        def show(self, env):
+        def show(self, env, wait=0.6):
             saved = tempfile.tempdir
             tempfile.tempdir = self.tmp
             try:
-                with mock.patch.dict(os.environ, env):
+                with mock.patch.dict(os.environ, env), mock.patch.dict(globals(), {"AGTERM_LOAD_WAIT": wait}):
                     return show_in_agterm("<p>page</p>")
             finally:
                 tempfile.tempdir = saved
 
+        def page_path(self):
+            return os.path.join(self.tmp, "plugin-freshness-SID-1.html")
+
         def node(self, **fields):
-            return {"workspaces": [{"id": "W", "sessions": [dict({"id": "sid-1", "overlay": False}, **fields)]}]}
+            return {"workspaces": [{"id": "W", "sessions": [dict({"id": "sid-1", "overlay": False, "active": True},
+                                                                **fields)]}]}
+
+        def loaded(self, state="loaded", **fields):
+            return self.node(overlay=True, htmlOverlays=[dict({"file": self.page_path(), "state": state}, **fields)])
 
         def test_show_outside_agterm(self):
             with mock.patch.dict(os.environ, {"AGTERM_ENABLED": ""}):
@@ -1507,22 +1581,36 @@ def run_self_tests() -> int:
             self.assertEqual(self.show(env), (False, "agtermctl is not on PATH"))
 
         def test_show_opens_page_on_free_slot(self):
-            env, log = self.fake_agterm(self.node())
+            env, log = self.fake_agterm(self.node(), after=self.loaded())
             shown, path = self.show(env)
-            self.assertTrue(shown)
-            self.assertEqual(path, os.path.join(self.tmp, "plugin-freshness-SID-1.html"))
+            self.assertEqual((shown, path), (True, self.page_path()))
             self.assertEqual(open(path).read(), "<p>page</p>")
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertIn("tree --json --window WIN-1 --socket /tmp/fake.sock", self.calls(log))
-            self.assertIn(f"session overlay open --html {path} --target SID-1 --socket /tmp/fake.sock", self.calls(log))
+            # The action names the same window as the tree read, not agterm's frontmost one.
+            self.assertIn(f"session overlay open --html {path} --target SID-1 --window WIN-1 --socket /tmp/fake.sock",
+                          self.calls(log))
             self.assertFalse(any("--follow" in c for c in self.calls(log)))  # never pulls the user over
 
         def test_show_reloads_its_own_page(self):
-            path = os.path.join(self.tmp, "plugin-freshness-SID-1.html")
-            env, log = self.fake_agterm(self.node(overlay=True, htmlOverlays=[{"file": path, "state": "loaded"}]))
-            self.assertEqual(self.show(env), (True, path))
-            self.assertIn("session overlay reload --target SID-1 --socket /tmp/fake.sock", self.calls(log))
+            env, log = self.fake_agterm(self.loaded(), after=self.loaded())
+            self.assertEqual(self.show(env), (True, self.page_path()))
+            self.assertIn("session overlay reload --target SID-1 --window WIN-1 --socket /tmp/fake.sock", self.calls(log))
             self.assertFalse(any(" open --html" in c for c in self.calls(log)))
+
+        def test_show_counts_only_a_loaded_page(self):
+            env, log = self.fake_agterm(self.node(), after=self.loaded("failed", error="boom"))
+            self.assertEqual(self.show(env), (False, "the page failed to load: boom"))
+            env, log = self.fake_agterm(self.node(), after=self.loaded("loading"))
+            self.assertEqual(self.show(env, wait=0.3), (False, "the page did not finish loading"))
+            env, log = self.fake_agterm(self.node(), after=self.node())
+            self.assertEqual(self.show(env, wait=0.3), (False, "the page did not appear in the overlay slot"))
+            after = self.loaded()
+            after["workspaces"][0]["sessions"][0]["active"] = False
+            env, log = self.fake_agterm(self.node(), after=after)
+            shown, detail = self.show(env)
+            self.assertTrue(shown)
+            self.assertIn("not the one selected in agterm", detail)
 
         def test_show_leaves_a_busy_slot_alone(self):
             for fields in ({"overlay": True},
@@ -1534,6 +1622,29 @@ def run_self_tests() -> int:
                 self.assertFalse(any(c.startswith("session overlay") and "--help" not in c for c in self.calls(log)))
             env, log = self.fake_agterm({"workspaces": []})
             self.assertEqual(self.show(env), (False, "this session is not in the agterm tree"))
+            env, log = self.fake_agterm(tree_fails=True)
+            self.assertEqual(self.show(env), (False, "agtermctl tree failed: Operation not permitted"))
+
+        def test_write_private_ignores_planted_files(self):
+            target = os.path.join(self.tmp, "victim.txt")
+            write(target, "keep")
+            path = os.path.join(self.tmp, "page.html")
+            # The old fixed temp name, planted as a link to another file.
+            os.symlink(target, f"{path}.{os.getpid()}.tmp")
+            write(path, "old")
+            os.chmod(path, 0o644)
+            write_private(path, "new")
+            self.assertEqual(open(target).read(), "keep")
+            self.assertEqual(open(path).read(), "new")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            # A link at the destination is replaced, never written through.
+            os.remove(path)
+            os.symlink(target, path)
+            write_private(path, "newer")
+            self.assertFalse(os.path.islink(path))
+            self.assertEqual(open(target).read(), "keep")
+            leftovers = [n for n in os.listdir(self.tmp) if n.startswith(".page.html.")]
+            self.assertEqual(leftovers, [])
 
         def test_cli_html_and_show_flags(self):
             self.base()

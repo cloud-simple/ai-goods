@@ -21,9 +21,13 @@ and one `git ls-remote` per marketplace, in parallel.
 show HTML. The page has the same content as the Markdown, with rendered tables. The script decides this
 itself, and the last line of its output says what happened:
 
-- `[agterm overlay] shown: <file>`: the page is open.
-- `[agterm overlay] not shown: <reason>`: no page, for example outside agterm, or when the session's
-  overlay slot already holds another page, a program or a HUD. The script never replaces those.
+- `[agterm overlay] shown: <file>`: the page is open and agterm reports it loaded. When the line adds
+  "not the one selected in agterm", the user is looking at another session and sees the page after
+  switching to this one.
+- `[agterm overlay] not shown: <reason>`: no page. For example: outside agterm, the page failed to
+  load, or the session's overlay slot already held another page, a program or a HUD. The script checks
+  the slot first and leaves those alone. It cannot rule out something taking the slot in the moment
+  between its check and the open.
 
 | Exit code | Meaning |
 |---|---|
@@ -39,9 +43,10 @@ then `unknown`.
 1. Lead with one sentence of counts: how many plugins are current, how many have an update, how many
    are `unknown`, and how many cache directories are stale or orphaned.
 2. Show the details. Which way depends on the last output line:
-   - **`shown`**: the user sees the full report on the page. Say it is open in the agterm overlay,
-     and that ⌘W closes it. Do not repeat the tables in the reply. Give only the rows that are not
-     `current`, and the `bash` block of fix commands, so the user can copy them from the reply.
+   - **`shown`**: the full report is on the page. Say it is open in the agterm overlay of this
+     session, and that ⌘W closes it. When the line says the session is not the selected one, say the
+     user sees it after switching here. Do not repeat the tables in the reply. Give only the rows that
+     are not `current`, and the `bash` block of fix commands, so the user can copy them from the reply.
    - **`not shown`**, or no such line: paste the script's output into your reply as Markdown,
      unchanged, without the `[agterm overlay]` line. It holds a marketplace table, a plugin table,
      stale cache directories, orphaned cache entries, marketplaces with auto-update off, what was not
