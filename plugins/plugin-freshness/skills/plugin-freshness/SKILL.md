@@ -30,9 +30,10 @@ then `unknown`.
 
 1. Lead with one sentence of counts: how many plugins are current, how many have an update, how many
    are `unknown`, and how many cache directories are stale or orphaned.
-2. Show the script's output as printed. It is Markdown: a marketplace table, a plugin table, stale
-   cache directories, orphaned cache entries, marketplaces with auto-update off, what was not
-   checked, and the commands to fix.
+2. Paste the script's output into your reply as Markdown, unchanged. It holds a marketplace table, a
+   plugin table, stale cache directories, orphaned cache entries, marketplaces with auto-update off,
+   what was not checked, and the commands to fix. Do not wrap the whole output in a code block: a code
+   block shows the tables as raw `|` text. The fix commands already sit in their own `bash` block.
 3. Explain each `unknown` row with the note the script gives. Do not replace `unknown` with a guess.
 
 ## Rules
