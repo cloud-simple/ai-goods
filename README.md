@@ -39,6 +39,11 @@ The report has:
 The skill never runs those commands. It never fetches, updates, installs or deletes. A cache
 directory that a running session still uses gets no `rm` command.
 
+Inside [agterm](https://github.com/umputun/agterm), the skill also opens the report as a page over the
+session, with rendered tables in the terminal's theme colors. It checks that agterm can show HTML
+first. Outside agterm, or when the session's overlay already shows something else, the reply carries
+the Markdown report as before.
+
 Semver plugins are compared by version. Path-based plugins, whose version is a 12-character
 marketplace commit hash, are compared by commit. When the version or commit matches, the installed
 files are compared with the marketplace copy too. A mismatch is reported as `unknown`: a plugin
@@ -49,6 +54,8 @@ The check runs on its own too:
 ```bash
 python3 plugins/plugin-freshness/skills/plugin-freshness/scripts/plugin_freshness.py
 python3 plugins/plugin-freshness/skills/plugin-freshness/scripts/plugin_freshness.py --no-remote  # offline
+python3 plugins/plugin-freshness/skills/plugin-freshness/scripts/plugin_freshness.py --show       # also open the page in agterm
+python3 plugins/plugin-freshness/skills/plugin-freshness/scripts/plugin_freshness.py --html report.html  # also write the page to a file
 python3 plugins/plugin-freshness/skills/plugin-freshness/scripts/plugin_freshness.py --test       # self-tests
 ```
 
