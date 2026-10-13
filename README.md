@@ -6,7 +6,7 @@ own plugin in the `ai-goods` plugin marketplace.
 | plugin | what it does |
 |---|---|
 | [`plugin-freshness`](#plugin-freshness) | reports whether installed plugins and plugin marketplaces are current, without changing anything |
-| [`skill-creator-guard`](#skill-creator-guard) | hooks that keep skill-creator's trigger evals honest |
+| [`skill-creator-guard`](#skill-creator-guard) | hooks that keep skill-creator's trigger evals honest and show what a run costs before it starts |
 
 ## Install
 
@@ -87,7 +87,8 @@ The design spec is [docs/specs/plugin-freshness-spec.md](docs/specs/plugin-fresh
 Hooks that keep [skill-creator](https://github.com/anthropics/claude-plugins-official)'s trigger evals
 honest. skill-creator's `scripts/run_eval.py` and `scripts/run_loop.py` measure how often a skill
 description makes Claude load the skill. For each test run they write a copy of the skill to the
-nearest `.claude/commands/` folder. Two things go wrong:
+nearest `.claude/commands/` folder, then starts a `claude -p` session to see whether Claude loads it.
+Four things go wrong:
 
 - **Parallel runs score too low.** With several runs at once (the default is 10), Claude loads
   another run's copy, and the run counts as a miss. A skill that always triggers scores about 1 in
@@ -95,13 +96,36 @@ nearest `.claude/commands/` folder. Two things go wrong:
 - **The copies leak into other sessions.** skill-creator runs its scripts from inside the plugin
   cache. The nearest `.claude/` folder above it is your home folder's, so the copies land in
   `~/.claude/commands/` and appear in every running Claude Code session.
+- **A run costs more than it looks.** Every test is a separate `claude -p` session that loads your
+  whole Claude Code setup and counts toward your usage limit. With the defaults, 3 runs per query
+  and 5 rounds, `run_loop` on a 20-query eval set starts up to 300 of them. In `run_loop`, `--model`
+  sets the model of every test session too. Nothing shows that number before the run starts.
+- **Failed tests count as misses.** A test session that fails, for example once the usage limit is
+  reached, counts as a miss, and `run_eval` prints no error for it. A round cut short by the limit
+  reports a collapsed recall that says nothing about the description.
 
 The plugin adds two hooks:
 
 | Hook | Fires on | What it does |
 |---|---|---|
 | `PostToolUse`, matcher `Skill` | skill-creator loading | adds the eval rules to Claude's context |
-| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), or runs where the copies would reach `~/.claude` or a git repository |
+| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), or runs where the copies would reach `~/.claude` or a git repository; otherwise asks you to confirm the run |
+
+The confirmation shows the size of the run, read from its options and its eval set file:
+
+```
+Confirm a skill-creator eval run. run_loop starts up to 300 test sessions (20 queries × 3 runs ×
+5 rounds) and up to 4 description rewrites, on claude-fable-5-1. Each test session is a separate
+`claude -p` run that loads your whole Claude Code setup and counts toward your usage limit.
+```
+
+The number is a maximum: `run_loop` stops early when every training query passes. The prompt appears
+in auto mode too. A session that cannot show a prompt, such as `claude -p`, denies the run, and
+Claude gets the size as the reason.
+
+The rules Claude gets when skill-creator loads cover the same ground: one worker, a scratch folder,
+no bytecode, the cost of a run, one `run_eval` pass before any `run_loop`, and how to spot a round
+that failed sessions spoiled.
 
 The `Bash` hook reads the command the way a shell splits it:
 - **What it parses:** quotes, comments, heredocs, `;` `&&` `||` `|`, subshells and `$( )`.

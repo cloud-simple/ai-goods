@@ -1,7 +1,7 @@
 {
   "name": "skill-creator-guard",
-  "description": "Hooks that keep skill-creator's trigger evals honest: they add the eval rules when skill-creator loads, and block a run_eval or run_loop run with parallel workers, from the plugin cache or home folder, or without PYTHONDONTWRITEBYTECODE=1",
-  "version": "0.1.0",
+  "description": "Hooks that keep skill-creator's trigger evals honest and their cost visible: they add the eval rules when skill-creator loads, block a run_eval or run_loop run with parallel workers, from the plugin cache or home folder, or without PYTHONDONTWRITEBYTECODE=1, and ask the user to confirm any other run with the number of claude -p sessions it starts",
+  "version": "0.2.0",
   "author": {
     "name": "cloud-simple"
   },

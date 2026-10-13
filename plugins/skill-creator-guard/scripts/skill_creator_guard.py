@@ -12,7 +12,14 @@ run_eval.py creates a separate project folder per run.
 Two events, wired in the skill-creator-guard plugin's hooks/hooks.json:
 
   PostToolUse, matcher "Skill"  after skill-creator loads, add RULES to Claude's context.
-  PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule.
+  PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule. Ask
+                                the user to confirm any other run, with the number of claude -p
+                                sessions it starts and the model they run on.
+
+Every test is a separate claude -p session that loads the user's whole Claude Code setup, so a
+run_loop with the defaults (3 runs per query, 5 rounds) on a 20-query eval set starts up to 300 of
+them. Nothing in skill-creator shows that number before the run, and a test session that fails, for
+example at the usage limit, silently counts as a miss.
 
 The Bash check parses the command the way a shell splits it: quotes, escapes, comments, heredocs,
 separators, ( ) subshells, redirects (with their file-descriptor numbers), and $( ) and backtick
@@ -58,8 +65,18 @@ command, so the hook can check it.
 
 - Treat a low trigger rate from a parallel run as unproven. Confirm it with `--num-workers 1` before \
 changing a description.
+- Each test is a separate `claude -p` session that loads the user's whole Claude Code setup and counts \
+toward the usage limit. One pass starts a session for every query, `--runs-per-query` times (default \
+3). `run_loop` repeats the pass for up to `--max-iterations` rounds (default 5), and its `--model` sets \
+the model of every test session, not only of the rewrites.
+- Measure the current description with one `run_eval` pass first. Start `run_loop` only when that pass \
+shows misses worth fixing.
+- A test session that fails, for example once the usage limit is reached, counts as a miss, and \
+`run_eval` prints no error for it. Treat a round as unproven when its recall drops sharply, it finishes \
+much faster than the round before, or the run ends with `claude -p exited`. Rerun it before acting on it.
 
-The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules."""
+The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules. It asks the user \
+to confirm every other run and shows how many sessions the run starts."""
 
 EVAL_SCRIPTS = ("run_eval", "run_loop")
 PYTHON = re.compile(r"python[0-9.]*")
@@ -81,6 +98,14 @@ SKILL_NAME = re.compile(r"^name:\s*['\"]?skill-creator['\"]?\s*$", re.M)
 MAX_DEPTH = 6
 UNKNOWN_FOLDER = ("its folder cannot be worked out from the command; write the scratch folder as a "
                   "literal path, or set the variable in the same command")
+# The long options of each script, for argparse's prefix matching.
+RUN_EVAL_OPTIONS = ("--help", "--eval-set", "--skill-path", "--description", "--num-workers", "--timeout",
+                    "--runs-per-query", "--trigger-threshold", "--model", "--verbose")
+OPTIONS = {"run_eval": RUN_EVAL_OPTIONS,
+           "run_loop": RUN_EVAL_OPTIONS + ("--max-iterations", "--holdout", "--report", "--results-dir")}
+# run_eval and run_loop defaults.
+RUNS_PER_QUERY, MAX_ITERATIONS = 3, 5
+MAX_EVAL_SET_BYTES = 5_000_000
 
 
 def emit(obj) -> None:
@@ -393,15 +418,61 @@ def is_skill_creator(script_path: str) -> bool:
 
 # ---------------------------------------------------------------- command analysis
 
-def workers_value(args: list):
-    """The value given to --num-workers, last one winning, as argparse does. argparse also accepts
-    unambiguous prefixes such as --num-w."""
+def option_value(args: list, option: str, script: str):
+    """The value given to an option, last one winning, as argparse does. argparse also accepts a
+    prefix that matches only this option among the script's options, such as --num-w for --num-workers."""
     value = None
     for k, a in enumerate(args):
         key, eq, v = a.partition("=")
-        if len(key) >= 5 and "--num-workers".startswith(key):
+        if len(key) > 2 and option.startswith(key) and (
+                key == option or [o for o in OPTIONS[script] if o.startswith(key)] == [option]):
             value = v if eq else (args[k + 1] if k + 1 < len(args) else None)
     return value
+
+
+def count_value(value, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default  # argparse rejects it and the run starts nothing
+
+
+def eval_set_size(path):
+    """The number of queries in an eval set file, or None when it cannot be read."""
+    try:
+        if os.path.getsize(path) > MAX_EVAL_SET_BYTES:
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, TypeError, ValueError):
+        return None
+    return len(data) if isinstance(data, list) else None
+
+
+def plural(n: int, word: str, many: str = "") -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {many or word + 's'}"
+
+
+def run_size(script: str, args: list, ctx: Ctx, env: dict) -> str:
+    """One sentence on how many claude -p sessions a run starts and on which model."""
+    loop = script == "run_loop"
+    path = option_value(args, "--eval-set", script)
+    queries = eval_set_size(resolve(path, ctx, env)) if path else None
+    runs = count_value(option_value(args, "--runs-per-query", script), RUNS_PER_QUERY)
+    rounds = count_value(option_value(args, "--max-iterations", script), MAX_ITERATIONS) if loop else 1
+    model = option_value(args, "--model", script) or "your default model"
+    factors = plural(runs, "run") + (" × " + plural(rounds, "round") if loop else "")
+    up_to = "up to " if loop else ""
+    if queries is None:
+        sessions = (f"{up_to}{plural(runs * rounds, 'test session')} for each query in the eval set "
+                    f"({factors}); the hook could not read the eval set to count its queries")
+    else:
+        sessions = (f"{up_to}{plural(queries * runs * rounds, 'test session')} "
+                    f"({plural(queries, 'query', 'queries')} × {factors})")
+    rewrites = f" and up to {plural(rounds - 1, 'description rewrite')}" if loop and rounds > 1 else ""
+    return f"{script} starts {sessions}{rewrites}, on {model}."
 
 
 def eval_target(argv: list):
@@ -477,6 +548,7 @@ def shell_script(argv: list):
 class Analyzer:
     def __init__(self):
         self.problems = []
+        self.sizes = []  # one sentence per eval run found, for the confirmation prompt
 
     def add(self, problem: str) -> None:
         if problem not in self.problems:
@@ -637,7 +709,9 @@ class Analyzer:
         child = ctx.child_env(env, removed, clean)
         if ctx.cwd is not None and not belongs_to_skill_creator(kind, target, ctx, ctx.cwd, child):
             return None  # another project's own run_eval.py
-        value = workers_value(args)
+        script = target.rsplit(".", 1)[-1] if kind == "module" else os.path.basename(target)[:-3]
+        self.sizes.append(run_size(script, args, ctx, env))
+        value = option_value(args, "--num-workers", script)
         try:
             one = value is not None and int(value) == 1
         except ValueError:
@@ -663,14 +737,22 @@ def pre_tool_use(data: dict) -> None:
         return  # fast path: nothing to parse
     analyzer = Analyzer()
     analyzer.script(command, Ctx(real(data.get("cwd") or os.getcwd()), set()))
-    if not analyzer.problems:
-        return
-    emit({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(analyzer.problems)
-                                    + ".\n\n" + RULES,
-    }})
+    if analyzer.problems:
+        emit({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(analyzer.problems)
+                                        + ".\n\n" + RULES,
+        }})
+    elif analyzer.sizes:
+        # The reason goes to the user, who pays for the sessions.
+        emit({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": "Confirm a skill-creator eval run. " + " ".join(analyzer.sizes)
+                                        + " Each test session is a separate `claude -p` run that loads "
+                                          "your whole Claude Code setup and counts toward your usage limit.",
+        }})
 
 
 def post_tool_use(data: dict) -> None:
@@ -703,6 +785,8 @@ def run_self_tests() -> int:
                 f.write("---\nname: skill-creator\ndescription: x\n---\n")
             cls.scratch = os.path.join(home, "scratch")             # the right place: its own .claude/
             os.makedirs(os.path.join(cls.scratch, ".claude"))
+            with open(os.path.join(cls.scratch, "e.json"), "w") as f:  # the eval set RUN names: 4 queries
+                json.dump([{"query": f"q{n}", "should_trigger": n % 2 == 0} for n in range(4)], f)
             cls.repo_plain = os.path.join(home, "work", "repo")      # a repo without .claude/
             cls.repo_claude = os.path.join(home, "work", "repo2")    # a repo with its own .claude/
             cls.other = os.path.join(home, "work", "other")          # another project's own run_eval.py
@@ -762,30 +846,73 @@ def run_self_tests() -> int:
             if not self.has_git:
                 self.skipTest("git is not installed")
 
-        # Allowed runs.
+        # Runs that keep the rules: the user confirms them.
 
-        def test_good_run_is_allowed(self):
-            self.expect(self.bash(self.good()), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers=1")), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", '--num-workers "1"')), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-w 1")), "allow")
+        def test_good_run_asks_for_confirmation(self):
+            self.expect(self.bash(self.good()), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers=1")), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", '--num-workers "1"')), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-w 1")), "ask")
             no_env = self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")
-            self.expect(self.bash(no_env.replace("python3 -m", "python3 -B -m")), "allow")
-            self.expect(self.bash(no_env.replace("python3 -m", "python3 -Bm")), "allow")
-            self.expect(self.bash(f"export PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "allow")
-            self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "allow")
+            self.expect(self.bash(no_env.replace("python3 -m", "python3 -B -m")), "ask")
+            self.expect(self.bash(no_env.replace("python3 -m", "python3 -Bm")), "ask")
+            self.expect(self.bash(f"export PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "ask")
+            self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "ask")
             self.expect(self.bash(f'cd "{self.scratch}" && PYTHONDONTWRITEBYTECODE=1 '
-                                  f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1'), "allow")
-            self.expect(self.bash(f"S={self.scratch}; cd \"$S\" && {self.RUN}"), "allow")
+                                  f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1'), "ask")
+            self.expect(self.bash(f"S={self.scratch}; cd \"$S\" && {self.RUN}"), "ask")
+
+        def test_confirmation_shows_the_run_size(self):
+            loop = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 1 "
+            self.expect(self.bash(self.good()),
+                        "ask", "run_eval starts 12 test sessions (4 queries × 3 runs), on your default model.")
+            self.expect(self.bash(self.good() + " --runs-per-query 1 --model m1"),
+                        "ask", "run_eval starts 4 test sessions (4 queries × 1 run), on m1.")
+            self.expect(self.bash(loop + "--eval-set e.json --model m1"),
+                        "ask", "run_loop starts up to 60 test sessions (4 queries × 3 runs × 5 rounds) and up "
+                               "to 4 description rewrites, on m1.")
+            # argparse prefixes and --option=value, the last value winning.
+            self.expect(self.bash(loop + "--eval-s=e.json --runs 2 --runs=1 --max 2 --mo m2"),
+                        "ask", "up to 8 test sessions (4 queries × 1 run × 2 rounds) and up to 1 description "
+                               "rewrite, on m2.")
+            # A prefix counts when it is unique among that script's options: --m and --r are in
+            # run_eval, but in run_loop --m also matches --max-iterations and --r --report.
+            self.expect(self.bash(self.good() + " --m m3 --r 1"),
+                        "ask", "run_eval starts 4 test sessions (4 queries × 1 run), on m3.")
+            self.expect(self.bash(loop + "--eval-set e.json --m m3 --r 1 --mo m1"),
+                        "ask", "up to 60 test sessions (4 queries × 3 runs × 5 rounds) and up to 4 description "
+                               "rewrites, on m1.")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--n 1")), "ask")
+            self.expect(self.bash(loop + "--eval-set e.json --max-iterations 1 --model m1"),
+                        "ask", "up to 12 test sessions (4 queries × 3 runs × 1 round), on m1.")
+            # The eval set path follows cd and variables like the folder does.
+            evals = os.path.join(self.home, "evals")
+            os.makedirs(evals, exist_ok=True)
+            with open(os.path.join(evals, "one.json"), "w") as f:
+                json.dump([{"query": "q", "should_trigger": True}], f)
+            self.expect(self.bash(f'E={evals}/one.json; {self.good()} --eval-set "$E"'),
+                        "ask", "3 test sessions (1 query × 3 runs)")
+            self.expect(self.bash(f"cd {evals} && cd {self.scratch} && {self.RUN} --eval-set ../evals/one.json"),
+                        "ask", "3 test sessions (1 query × 3 runs)")
+            # An eval set the hook cannot read still gets a prompt.
+            for missing in ("missing.json", '"$NOT_SET"'):
+                with self.subTest(missing=missing):
+                    self.expect(self.bash(f"{self.good()} --eval-set {missing}"),
+                                "ask", "3 test sessions for each query in the eval set (3 runs); the hook "
+                                       "could not read the eval set")
+            # Two runs in one command: both sizes.
+            result = self.bash(f"{self.good()}; {loop}--eval-set e.json --model m1")
+            self.expect(result, "ask", "run_eval starts 12")
+            self.assertIn("run_loop starts up to 60", result[1])
 
         def test_folder_created_by_the_same_command_is_allowed(self):
             new = os.path.join(self.home, "not-yet")
-            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "allow")
+            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "ask")
 
         def test_quoted_cd_paths_count(self):
             spaced = os.path.join(self.home, "scratch dir")
             os.makedirs(os.path.join(spaced, ".claude"), exist_ok=True)
-            self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "allow")
+            self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "ask")
             self.expect(self.bash(f"cd '{self.cache}' && {self.RUN}"), "deny", "it runs inside")
 
         def test_another_projects_run_eval_is_not_skill_creators(self):
@@ -816,7 +943,7 @@ def run_self_tests() -> int:
             self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "deny", self.BYTECODE)
             # Inherited from the environment, then removed.
             inherited = {"PYTHONDONTWRITEBYTECODE": "1"}
-            self.expect(self.bash(no_env, extra_env=inherited), "allow")
+            self.expect(self.bash(no_env, extra_env=inherited), "ask")
             self.expect(self.bash(no_env.replace("python3", "env -u PYTHONDONTWRITEBYTECODE python3"),
                                   extra_env=inherited), "deny", self.BYTECODE)
             self.expect(self.bash(no_env.replace("python3", "env -i python3"), extra_env=inherited),
@@ -883,11 +1010,11 @@ def run_self_tests() -> int:
             run = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --num-workers 1"
             self.expect(self.bash(f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 env -i python3 -m scripts.run_eval "
                                   "--num-workers 1"), "deny", self.BYTECODE)
-            self.expect(self.bash(f"cd {self.scratch} && env -i {run}"), "allow")
+            self.expect(self.bash(f"cd {self.scratch} && env -i {run}"), "ask")
             self.need_git()
             self.expect(self.bash(f"env -C {self.repo_claude} {run}"), "deny", self.GIT)
             self.expect(self.bash(f"env --chdir={self.repo_claude} {run}"), "deny", self.GIT)
-            self.expect(self.bash(f"env -C {self.scratch} {run}", cwd=self.repo_claude), "allow")
+            self.expect(self.bash(f"env -C {self.scratch} {run}", cwd=self.repo_claude), "ask")
 
         def test_substitution_runs_where_it_is(self):
             self.need_git()
@@ -921,6 +1048,7 @@ def run_self_tests() -> int:
         def test_rules_follow_skill_creator_only(self):
             for name in ("skill-creator:skill-creator", "anthropic-skills:skill-creator"):
                 self.expect(self.skill(name), "context", "--num-workers 1")
+                self.expect(self.skill(name), "context", "`claude -p exited`")
             self.expect(self.skill("plugin-freshness:plugin-freshness"), "allow")
 
         def test_other_events_and_garbage_are_ignored(self):
