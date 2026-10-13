@@ -111,12 +111,33 @@ def read_paren(text: str, i: int) -> tuple:
     return text[i:], n
 
 
+def substitutions(text: str) -> list:
+    """The $( ) and backtick bodies in text the shell expands without word splitting, such as an
+    unquoted heredoc body."""
+    found, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+        elif text.startswith("$(", i):
+            body, i = read_paren(text, i + 2)
+            found.append(body)
+        elif text[i] == "`":
+            j = text.find("`", i + 1)
+            j = n if j < 0 else j
+            found.append(text[i + 1:j])
+            i = j + 1
+        else:
+            i += 1
+    return found
+
+
 def tokenize(text: str) -> list:
     """Split shell text into tokens (kind, value, subs):
 
       ("w", word, [substitution bodies])  a word with quotes removed
       ("op", operator, [])                a separator, paren or redirect
-      ("heredoc", body, [])               the body of the heredoc started on the line before
+      ("heredoc", body, [subs])           the body of the heredoc started on the line before; an
+                                          unquoted delimiter means its $( ) and backticks run
       ("herestring", word, [subs])        the word after <<<
     """
     tokens = []
@@ -131,7 +152,7 @@ def tokenize(text: str) -> list:
         if in_word:
             w = "".join(word)
             if delim_next is not None:
-                pending.append((w, delim_next))
+                pending.append((w, delim_next, quoted))
                 delim_next = None
             elif herestring_next:
                 tokens.append(("herestring", w, subs))
@@ -162,7 +183,7 @@ def tokenize(text: str) -> list:
             end_word()
             tokens.append(("op", "\n", []))
             i += 1
-            for delim, strip in pending:
+            for delim, strip, delim_quoted in pending:
                 body = []
                 while i < n:
                     j = text.find("\n", i)
@@ -172,7 +193,8 @@ def tokenize(text: str) -> list:
                     if (line.lstrip("\t") if strip else line) == delim:
                         break
                     body.append(line)
-                tokens.append(("heredoc", "\n".join(body), []))
+                text_body = "\n".join(body)
+                tokens.append(("heredoc", text_body, [] if delim_quoted else substitutions(text_body)))
             pending = []
         elif c == "#" and not in_word:
             j = text.find("\n", i)
@@ -427,8 +449,8 @@ def eval_target(argv: list):
 
 
 def belongs_to_skill_creator(kind: str, target: str, ctx: Ctx, cwd, env: dict) -> bool:
-    """False only when the script resolves to a file outside a skill-creator skill folder, so another
-    project's own run_eval.py passes. A script that cannot be resolved still counts."""
+    """False only when every file the script can resolve to sits outside a skill-creator skill
+    folder, so another project's own run_eval.py passes. A script that cannot be resolved counts."""
     if kind == "file":
         path = resolve(target, ctx, env, cwd)
         candidates = [path] if path else []
@@ -436,10 +458,10 @@ def belongs_to_skill_creator(kind: str, target: str, ctx: Ctx, cwd, env: dict) -
         rel = target.replace(".", os.sep) + ".py"
         roots = [cwd] + [resolve(p, ctx, env, cwd) for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
         candidates = [os.path.join(r, rel) for r in roots if r]
-    for path in candidates:
-        if os.path.isfile(path):
-            return is_skill_creator(path)
-    return True
+    # Python's import rules (a regular package beats a namespace portion found earlier, among
+    # others) are not modeled: count the run when any existing candidate is skill-creator's.
+    found = [p for p in candidates if os.path.isfile(p)]
+    return not found or any(is_skill_creator(p) for p in found)
 
 
 def shell_script(argv: list):
@@ -530,14 +552,18 @@ class Analyzer:
                         env[key] = value
                     elif a in ("-i", "--ignore-environment", "-"):
                         clean = True
+                        env = {}  # env -i also drops assignments made before it
                     elif a in ("-u", "--unset") and j + 1 < len(argv):
                         removed.add(argv[j + 1])
                         env.pop(argv[j + 1], None)
                         j += 1
                     elif a.startswith("--unset="):
                         removed.add(a.split("=", 1)[1])
-                    elif a in ("-C", "--chdir"):
-                        j += 1
+                    elif a in ("-C", "--chdir") or a.startswith("--chdir="):
+                        target = a.split("=", 1)[1] if "=" in a else (argv[j + 1] if j + 1 < len(argv) else None)
+                        ctx = ctx.copy()  # the folder change lasts for this command only
+                        ctx.cwd = resolve(target, ctx, env)
+                        j += 0 if "=" in a else 1
                     j += 1
                 argv = argv[j:]
             elif name in WRAPPERS:
@@ -672,6 +698,7 @@ def run_self_tests() -> int:
             os.makedirs(os.path.join(cls.cache, "scripts"))
             for script in ("run_eval.py", "run_loop.py"):
                 open(os.path.join(cls.cache, "scripts", script), "w").close()
+            open(os.path.join(cls.cache, "scripts", "__init__.py"), "w").close()
             with open(os.path.join(cls.cache, "SKILL.md"), "w") as f:
                 f.write("---\nname: skill-creator\ndescription: x\n---\n")
             cls.scratch = os.path.join(home, "scratch")             # the right place: its own .claude/
@@ -765,9 +792,10 @@ def run_self_tests() -> int:
             self.need_git()
             self.expect(self.bash(f"cd {self.other} && ./scripts/run_eval.py --num-workers 10"), "allow")
             self.expect(self.bash(f"cd {self.other} && python3 -m scripts.run_eval"), "allow")
-            # The same module name pointed at skill-creator's copy is still checked.
+            # With skill-creator's copy on PYTHONPATH, Python can pick it over a namespace portion in the
+            # cwd, so the run counts.
             self.expect(self.bash(f"cd {self.other} && PYTHONPATH={self.cache} python3 -m scripts.run_eval"),
-                        "allow")  # cwd comes first on sys.path, so this still runs the other project's copy
+                        "deny", self.MISSING)
             self.expect(self.bash(f"cd {self.repo_plain} && PYTHONPATH={self.cache} python3 -m scripts.run_eval"),
                         "deny", self.MISSING)
 
@@ -843,6 +871,23 @@ def run_self_tests() -> int:
             self.expect(self.bash(f'BAD={self.repo_claude}; cd "$BAD"; {self.RUN}'), "deny", self.GIT)
             # An IO number before the command is not the command.
             self.expect(self.bash(f"2>log {self.RUN}", cwd=self.repo_claude), "deny", self.GIT)
+
+        def test_unquoted_heredoc_body_expands(self):
+            run10 = f"PYTHONDONTWRITEBYTECODE=1 PYTHONPATH={self.cache} python3 -m scripts.run_eval --num-workers 10"
+            self.expect(self.bash(f"cat <<EOF\n$({run10})\nEOF"), "deny", self.MISSING)
+            self.expect(self.bash(f"cat <<EOF\n`{run10}`\nEOF"), "deny", self.MISSING)
+            # A quoted delimiter keeps the body literal.
+            self.expect(self.bash(f"cat <<'EOF'\n$({run10})\nEOF"), "allow")
+
+        def test_env_options_are_modeled(self):
+            run = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --num-workers 1"
+            self.expect(self.bash(f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 env -i python3 -m scripts.run_eval "
+                                  "--num-workers 1"), "deny", self.BYTECODE)
+            self.expect(self.bash(f"cd {self.scratch} && env -i {run}"), "allow")
+            self.need_git()
+            self.expect(self.bash(f"env -C {self.repo_claude} {run}"), "deny", self.GIT)
+            self.expect(self.bash(f"env --chdir={self.repo_claude} {run}"), "deny", self.GIT)
+            self.expect(self.bash(f"env -C {self.scratch} {run}", cwd=self.repo_claude), "allow")
 
         def test_substitution_runs_where_it_is(self):
             self.need_git()
