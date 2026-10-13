@@ -11,6 +11,11 @@
       "name": "plugin-freshness",
       "source": "./plugins/plugin-freshness",
       "description": "Read-only check of whether Claude Code plugins and marketplaces are current, with stale and orphaned cache directories and the commands to fix them"
+    },
+    {
+      "name": "skill-creator-guard",
+      "source": "./plugins/skill-creator-guard",
+      "description": "Hooks that keep skill-creator's trigger evals honest: one worker at a time, run from a scratch folder, no bytecode in the plugin cache"
     }
   ]
 }
