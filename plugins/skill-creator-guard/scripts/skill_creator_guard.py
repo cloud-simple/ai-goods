@@ -12,7 +12,16 @@ run_eval.py creates a separate project folder per run.
 Two events, wired in the skill-creator-guard plugin's hooks/hooks.json:
 
   PostToolUse, matcher "Skill"  after skill-creator loads, add RULES to Claude's context.
-  PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule.
+  PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule. Ask
+                                the user to confirm any other run, with the number of claude -p
+                                sessions it starts and the model they run on.
+
+Every test is a separate claude -p session that loads the user's whole Claude Code setup, so a
+run_loop with the defaults (3 runs per query, 5 rounds) on a 20-query eval set starts up to 300 of
+them, plus up to 8 for the description rewrites. Nothing in skill-creator shows that number before
+the run, and a test session that fails, for example at the usage limit, silently counts as "not
+triggered". The test sessions start in the scratch folder and read its .claude/settings.json, so
+the hook requires that file to set allowedMcpServers: with [] no test session starts an MCP server.
 
 The Bash check parses the command the way a shell splits it: quotes, escapes, comments, heredocs,
 separators, ( ) subshells, redirects (with their file-descriptor numbers), and $( ) and backtick
@@ -44,22 +53,46 @@ Rules for skill-creator's run_eval.py and run_loop.py. They override skill-creat
 - Pass `--num-workers 1`. Each run writes its own copy of the skill to one shared `.claude/commands/` \
 folder. With parallel runs Claude loads another run's copy, and the run counts as a miss, so a skill \
 that always triggers scores about 1 in the number of workers.
-- Run them from a scratch directory that has its own empty `.claude/` folder. Never run them from inside \
+- Run them from a scratch directory that has its own `.claude/` folder. Never run them from inside \
 the plugin cache, a repository or the home directory: the scripts write their skill copies to the \
 nearest parent folder that has `.claude/`, and from the plugin cache that is `~/.claude`, so the \
 copies appear in every running Claude Code session. Write the folder as a literal path in the same \
 command, so the hook can check it.
+- Turn MCP servers off for the test sessions. Before the run, write `<scratch dir>/.claude/settings.json` \
+containing `{"allowedMcpServers": []}`. The test sessions start in the scratch directory and read that \
+file, so they start no MCP server: each one starts faster and carries no MCP tools or server \
+instructions. When the skill under test competes with an MCP server, list that server instead, for \
+example `{"allowedMcpServers": [{"serverName": "aws-pricing"}]}`.
 - Point Python at the scripts with `PYTHONPATH` and set `PYTHONDONTWRITEBYTECODE=1`, so no \
-`__pycache__` folder lands in the plugin cache:
+`__pycache__` folder lands in the plugin cache. With the settings file written, run:
 
-  mkdir -p <scratch dir>/.claude && cd <scratch dir> && \\
+  cd <scratch dir> && \\
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<skill-creator skill dir> \\
     python3 -m scripts.run_eval --eval-set <evals.json> --skill-path <skill dir> --num-workers 1 --verbose
 
 - Treat a low trigger rate from a parallel run as unproven. Confirm it with `--num-workers 1` before \
 changing a description.
+- Each test is a separate `claude -p` session that loads the user's whole Claude Code setup and counts \
+toward the usage limit. One pass starts a session for every query, `--runs-per-query` times (default \
+3). `run_loop` repeats the pass for up to `--max-iterations` rounds (default 5), and its `--model` sets \
+the model of every test session, not only of the rewrites.
+- Measure the current description with one `run_eval` pass first. Start `run_loop` only when that pass \
+shows misses worth fixing.
+- Avoid repeated status checks while an eval runs; wait for its completion unless it needs \
+intervention. Each check is a turn that re-reads the whole conversation.
+- Pass `--max-iterations 3` to `run_loop` unless the user asks for more rounds. Keep `--runs-per-query` \
+at its default of 3 unless the user agrees to a rough single-run look: with one run, a query that \
+triggers in some runs and not in others passes or fails by chance. Never pass `--holdout 0`: \
+`run_loop` runs the held-out queries in every round anyway, so it saves no sessions, and without them \
+the best description is picked by the score the rewrites were tuned against.
+- A test session that fails, for example once the usage limit is reached, counts as "not triggered", \
+and `run_eval` prints no error for it. A should-trigger query then fails and a should-not-trigger \
+query passes, so recall drops while precision can look perfect. Treat a round as unproven when its \
+recall drops sharply, it finishes much faster than the round before, or the run ends with \
+`claude -p exited`. Rerun it before acting on it.
 
-The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules."""
+The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules. It asks the user \
+to confirm every other run and shows how many sessions the run starts."""
 
 EVAL_SCRIPTS = ("run_eval", "run_loop")
 PYTHON = re.compile(r"python[0-9.]*")
@@ -81,6 +114,15 @@ SKILL_NAME = re.compile(r"^name:\s*['\"]?skill-creator['\"]?\s*$", re.M)
 MAX_DEPTH = 6
 UNKNOWN_FOLDER = ("its folder cannot be worked out from the command; write the scratch folder as a "
                   "literal path, or set the variable in the same command")
+# The long options of each script, for argparse's prefix matching, and the ones each script requires.
+RUN_EVAL_OPTIONS = ("--help", "--eval-set", "--skill-path", "--description", "--num-workers", "--timeout",
+                    "--runs-per-query", "--trigger-threshold", "--model", "--verbose")
+OPTIONS = {"run_eval": RUN_EVAL_OPTIONS,
+           "run_loop": RUN_EVAL_OPTIONS + ("--max-iterations", "--holdout", "--report", "--results-dir")}
+REQUIRED = {"run_eval": ("--eval-set", "--skill-path"), "run_loop": ("--eval-set", "--skill-path", "--model")}
+# run_eval and run_loop defaults.
+RUNS_PER_QUERY, MAX_ITERATIONS = 3, 5
+MAX_EVAL_SET_BYTES = 5_000_000
 
 
 def emit(obj) -> None:
@@ -377,7 +419,35 @@ def location_problem(directory: str, created: set):
                 "~/.claude/commands/ and show up in every session")
     if in_git_repo(nearest_existing(root)):
         return f"the nearest folder with .claude/ is {root}, which is inside a git repository"
+    # run_eval writes to root/.claude/commands/; a link on the way sends the copies somewhere else.
+    plain = os.path.join(root, ".claude", "commands")
+    actual = real(plain)
+    if actual != os.path.join(real(root), ".claude", "commands"):
+        return (f"{plain} leads through a link to {actual}, so the skill copies would land there; "
+                "make .claude/ a plain folder")
     return None
+
+
+def mcp_setting(root: str) -> tuple:
+    """The test sessions start in root and read root/.claude/settings.json. Return (problem, note):
+    a problem unless that file sets allowedMcpServers to a list, else a note on the servers kept."""
+    path = os.path.join(root, ".claude", "settings.json")
+    if not os.path.isfile(path):  # also a folder made by the same command
+        return (f'MCP servers are on for the test sessions: before the run, write {path} containing '
+                f'{{"allowedMcpServers": []}}'), None
+    try:
+        with open(path, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return f'{path} is not valid JSON; it must set "allowedMcpServers", for example to []', None
+    allowed = settings.get("allowedMcpServers") if isinstance(settings, dict) else None
+    if not isinstance(allowed, list):
+        return f'MCP servers are on for the test sessions: add "allowedMcpServers": [] to {path}', None
+    if not allowed:
+        return None, "with no MCP servers"
+    names = [str(e.get("serverName") or e.get("serverUrl") or " ".join(e.get("serverCommand") or []) or e)
+             if isinstance(e, dict) else str(e) for e in allowed]
+    return None, "with only these MCP servers: " + ", ".join(names)
 
 
 def is_skill_creator(script_path: str) -> bool:
@@ -393,15 +463,81 @@ def is_skill_creator(script_path: str) -> bool:
 
 # ---------------------------------------------------------------- command analysis
 
-def workers_value(args: list):
-    """The value given to --num-workers, last one winning, as argparse does. argparse also accepts
-    unambiguous prefixes such as --num-w."""
+def names_option(key: str, option: str, script: str) -> bool:
+    """Whether argparse reads key as option: the full name, or a prefix that matches only this option
+    among the script's options, such as --num-w for --num-workers."""
+    return len(key) > 2 and option.startswith(key) and (
+        key == option or [o for o in OPTIONS[script] if o.startswith(key)] == [option])
+
+
+def option_value(args: list, option: str, script: str):
+    """The value given to an option, last one winning, as argparse does."""
     value = None
     for k, a in enumerate(args):
         key, eq, v = a.partition("=")
-        if len(key) >= 5 and "--num-workers".startswith(key):
+        if names_option(key, option, script):
             value = v if eq else (args[k + 1] if k + 1 < len(args) else None)
     return value
+
+
+def asks_for_help(args: list, script: str) -> bool:
+    """-h or --help: argparse prints the usage and exits, so no session starts."""
+    return any(a == "-h" or names_option(a, "--help", script) for a in args)
+
+
+def positive(value) -> bool:
+    """Whether a count option is unset (the default applies) or a whole number of 1 or more."""
+    if value is None:
+        return True
+    try:
+        return int(value) >= 1
+    except ValueError:
+        return False
+
+
+def count_value(value, default: int) -> int:
+    """A count option checked by positive(), or its default when unset."""
+    return default if value is None else int(value)
+
+
+def eval_set_size(path):
+    """The number of queries in an eval set file, or None when it cannot be read."""
+    try:
+        if os.path.getsize(path) > MAX_EVAL_SET_BYTES:
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, TypeError, ValueError):
+        return None
+    return len(data) if isinstance(data, list) else None
+
+
+def plural(n: int, word: str, many: str = "") -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {many or word + 's'}"
+
+
+def run_size(script: str, args: list, ctx: Ctx, env: dict, mcp=None) -> str:
+    """One sentence on how many claude -p sessions a run starts, on which model, and with which MCP
+    servers (mcp, a note from mcp_setting)."""
+    loop = script == "run_loop"
+    path = option_value(args, "--eval-set", script)
+    queries = eval_set_size(resolve(path, ctx, env)) if path else None
+    runs = count_value(option_value(args, "--runs-per-query", script), RUNS_PER_QUERY)
+    rounds = count_value(option_value(args, "--max-iterations", script), MAX_ITERATIONS) if loop else 1
+    model = option_value(args, "--model", script) or "your default model"
+    factors = plural(runs, "run") + (" × " + plural(rounds, "round") if loop else "")
+    up_to = "up to " if loop else ""
+    if queries is None:
+        sessions = (f"{up_to}{plural(runs * rounds, 'test session')} for each query in the eval set "
+                    f"({factors}); the hook could not read the eval set to count its queries")
+    else:
+        sessions = (f"{up_to}{plural(queries * runs * rounds, 'test session')} "
+                    f"({plural(queries, 'query', 'queries')} × {factors})")
+    # improve_description starts one claude -p per rewrite, and a second one when the first answer
+    # is over 1024 characters.
+    rewrites = (f" and up to {plural(2 * (rounds - 1), 'more session')} for up to "
+                f"{plural(rounds - 1, 'description rewrite')}") if loop and rounds > 1 else ""
+    return f"{script} starts {sessions}{rewrites}, on {model}{', ' + mcp if mcp else ''}."
 
 
 def eval_target(argv: list):
@@ -477,6 +613,7 @@ def shell_script(argv: list):
 class Analyzer:
     def __init__(self):
         self.problems = []
+        self.sizes = []  # one sentence per eval run found, for the confirmation prompt
 
     def add(self, problem: str) -> None:
         if problem not in self.problems:
@@ -637,21 +774,44 @@ class Analyzer:
         child = ctx.child_env(env, removed, clean)
         if ctx.cwd is not None and not belongs_to_skill_creator(kind, target, ctx, ctx.cwd, child):
             return None  # another project's own run_eval.py
-        value = workers_value(args)
+        script = target.rsplit(".", 1)[-1] if kind == "module" else os.path.basename(target)[:-3]
+        help_only = asks_for_help(args, script)
+        value = option_value(args, "--num-workers", script)
         try:
             one = value is not None and int(value) == 1
         except ValueError:
             one = False
-        if not one:
+        if not (one or help_only):
             self.add("`--num-workers 1` is missing")
+        # Checked for --help too: Python imports the scripts package before argparse runs.
         if not (no_bytecode or child.get("PYTHONDONTWRITEBYTECODE")):
             self.add("`PYTHONDONTWRITEBYTECODE=1` is not set")
+        if help_only:
+            return None  # argparse prints the usage and exits: no session, no skill copy
+        mcp = None
         if ctx.cwd is None:
             self.add(UNKNOWN_FOLDER)
         else:
             where = location_problem(ctx.cwd, ctx.created)
             if where:
                 self.add(where)
+            else:
+                problem, mcp = mcp_setting(project_root(ctx.cwd, ctx.created))
+                if problem:
+                    self.add(problem)
+        # A missing required option stops the script in argparse, and a count below 1 runs its loops
+        # zero times: either way no session starts, so there is no size to confirm.
+        missing = [f"`{o}`" for o in REQUIRED[script] if option_value(args, o, script) is None]
+        if missing:
+            self.add(f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} missing, which "
+                     f"{script} requires")
+        counts = ("--runs-per-query", "--max-iterations") if script == "run_loop" else ("--runs-per-query",)
+        bad = [o for o in counts if not positive(option_value(args, o, script))]
+        for option in bad:
+            self.add(f"`{option}` must be a whole number of 1 or more, not "
+                     f"`{option_value(args, option, script)}`")
+        if not (missing or bad):
+            self.sizes.append(run_size(script, args, ctx, env, mcp))
         return None
 
 
@@ -663,14 +823,22 @@ def pre_tool_use(data: dict) -> None:
         return  # fast path: nothing to parse
     analyzer = Analyzer()
     analyzer.script(command, Ctx(real(data.get("cwd") or os.getcwd()), set()))
-    if not analyzer.problems:
-        return
-    emit({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(analyzer.problems)
-                                    + ".\n\n" + RULES,
-    }})
+    if analyzer.problems:
+        emit({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(analyzer.problems)
+                                        + ".\n\n" + RULES,
+        }})
+    elif analyzer.sizes:
+        # The reason goes to the user, who pays for the sessions.
+        emit({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": "Confirm a skill-creator eval run. " + " ".join(analyzer.sizes)
+                                        + " Each test session is a separate `claude -p` run that loads "
+                                          "your whole Claude Code setup and counts toward your usage limit.",
+        }})
 
 
 def post_tool_use(data: dict) -> None:
@@ -702,7 +870,9 @@ def run_self_tests() -> int:
             with open(os.path.join(cls.cache, "SKILL.md"), "w") as f:
                 f.write("---\nname: skill-creator\ndescription: x\n---\n")
             cls.scratch = os.path.join(home, "scratch")             # the right place: its own .claude/
-            os.makedirs(os.path.join(cls.scratch, ".claude"))
+            cls.make_scratch(cls.scratch)
+            with open(os.path.join(cls.scratch, "e.json"), "w") as f:  # the eval set RUN names: 4 queries
+                json.dump([{"query": f"q{n}", "should_trigger": n % 2 == 0} for n in range(4)], f)
             cls.repo_plain = os.path.join(home, "work", "repo")      # a repo without .claude/
             cls.repo_claude = os.path.join(home, "work", "repo2")    # a repo with its own .claude/
             cls.other = os.path.join(home, "work", "other")          # another project's own run_eval.py
@@ -720,6 +890,14 @@ def run_self_tests() -> int:
         @classmethod
         def tearDownClass(cls):
             shutil.rmtree(cls.tmp, ignore_errors=True)
+
+        @staticmethod
+        def make_scratch(path, settings='{"allowedMcpServers": []}'):
+            """A scratch folder with its own .claude/ and, unless settings is None, a settings file."""
+            os.makedirs(os.path.join(path, ".claude"), exist_ok=True)
+            if settings is not None:
+                with open(os.path.join(path, ".claude", "settings.json"), "w") as f:
+                    f.write(settings)
 
         def hook(self, payload, raw=None, extra_env=None):
             """Run this script the way Claude Code does: JSON on stdin, HOME set to the fake home."""
@@ -762,30 +940,150 @@ def run_self_tests() -> int:
             if not self.has_git:
                 self.skipTest("git is not installed")
 
-        # Allowed runs.
+        # Runs that keep the rules: the user confirms them.
 
-        def test_good_run_is_allowed(self):
-            self.expect(self.bash(self.good()), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers=1")), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", '--num-workers "1"')), "allow")
-            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-w 1")), "allow")
+        def test_good_run_asks_for_confirmation(self):
+            self.expect(self.bash(self.good()), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers=1")), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", '--num-workers "1"')), "ask")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-w 1")), "ask")
             no_env = self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")
-            self.expect(self.bash(no_env.replace("python3 -m", "python3 -B -m")), "allow")
-            self.expect(self.bash(no_env.replace("python3 -m", "python3 -Bm")), "allow")
-            self.expect(self.bash(f"export PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "allow")
-            self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "allow")
+            self.expect(self.bash(no_env.replace("python3 -m", "python3 -B -m")), "ask")
+            self.expect(self.bash(no_env.replace("python3 -m", "python3 -Bm")), "ask")
+            self.expect(self.bash(f"export PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "ask")
+            self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "ask")
             self.expect(self.bash(f'cd "{self.scratch}" && PYTHONDONTWRITEBYTECODE=1 '
-                                  f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1'), "allow")
-            self.expect(self.bash(f"S={self.scratch}; cd \"$S\" && {self.RUN}"), "allow")
+                                  f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1 --eval-set e.json '
+                                  "--skill-path x"), "ask")
+            self.expect(self.bash(f"S={self.scratch}; cd \"$S\" && {self.RUN}"), "ask")
 
-        def test_folder_created_by_the_same_command_is_allowed(self):
+        def test_confirmation_shows_the_run_size(self):
+            loop = (f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 1 "
+                    "--skill-path x ")
+            self.expect(self.bash(self.good()),
+                        "ask", "run_eval starts 12 test sessions (4 queries × 3 runs), on your default model, "
+                               "with no MCP servers.")
+            self.expect(self.bash(self.good() + " --runs-per-query 1 --model m1"),
+                        "ask", "run_eval starts 4 test sessions (4 queries × 1 run), on m1, with no MCP servers.")
+            self.expect(self.bash(loop + "--eval-set e.json --model m1"),
+                        "ask", "run_loop starts up to 60 test sessions (4 queries × 3 runs × 5 rounds) and up "
+                               "to 8 more sessions for up to 4 description rewrites, on m1, with no MCP servers.")
+            # argparse prefixes and --option=value, the last value winning.
+            self.expect(self.bash(loop + "--eval-s=e.json --runs 2 --runs=1 --max 2 --mo m2"),
+                        "ask", "up to 8 test sessions (4 queries × 1 run × 2 rounds) and up to 2 more sessions "
+                               "for up to 1 description rewrite, on m2, with no MCP servers.")
+            # A prefix counts when it is unique among that script's options: --m and --r are in
+            # run_eval, but in run_loop --m also matches --max-iterations and --r --report.
+            self.expect(self.bash(self.good() + " --m m3 --r 1"),
+                        "ask", "run_eval starts 4 test sessions (4 queries × 1 run), on m3, with no MCP "
+                               "servers.")
+            self.expect(self.bash(loop + "--eval-set e.json --m m3 --r 1 --mo m1"),
+                        "ask", "up to 60 test sessions (4 queries × 3 runs × 5 rounds) and up to 8 more "
+                               "sessions for up to 4 description rewrites, on m1, with no MCP servers.")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--n 1")), "ask")
+            self.expect(self.bash(loop + "--eval-set e.json --max-iterations 1 --model m1"),
+                        "ask", "up to 12 test sessions (4 queries × 3 runs × 1 round), on m1, with no MCP "
+                               "servers.")
+            # The eval set path follows cd and variables like the folder does.
+            evals = os.path.join(self.home, "evals")
+            os.makedirs(evals, exist_ok=True)
+            with open(os.path.join(evals, "one.json"), "w") as f:
+                json.dump([{"query": "q", "should_trigger": True}], f)
+            self.expect(self.bash(f'E={evals}/one.json; {self.good()} --eval-set "$E"'),
+                        "ask", "3 test sessions (1 query × 3 runs)")
+            self.expect(self.bash(f"cd {evals} && cd {self.scratch} && {self.RUN} --eval-set ../evals/one.json"),
+                        "ask", "3 test sessions (1 query × 3 runs)")
+            # An eval set the hook cannot read still gets a prompt.
+            for missing in ("missing.json", '"$NOT_SET"'):
+                with self.subTest(missing=missing):
+                    self.expect(self.bash(f"{self.good()} --eval-set {missing}"),
+                                "ask", "3 test sessions for each query in the eval set (3 runs); the hook "
+                                       "could not read the eval set")
+            # Two runs in one command: both sizes.
+            result = self.bash(f"{self.good()}; {loop}--eval-set e.json --model m1")
+            self.expect(result, "ask", "run_eval starts 12")
+            self.assertIn("run_loop starts up to 60", result[1])
+
+        def test_mcp_servers_must_be_off(self):
+            MCP_ON = "MCP servers are on for the test sessions"
+            folder = os.path.join(self.home, "mcp")
+            cases = (
+                (None, "deny", MCP_ON + ": before the run, write " + os.path.join(folder, ".claude", "settings.json")),
+                ('{"model": "opus"}', "deny", MCP_ON + ': add "allowedMcpServers": []'),
+                ('{"allowedMcpServers": "none"}', "deny", MCP_ON + ': add "allowedMcpServers": []'),
+                ("[]", "deny", MCP_ON),
+                ("{not json", "deny", 'is not valid JSON; it must set "allowedMcpServers"'),
+                ('{"allowedMcpServers": [{"serverName": "aws-pricing"}, {"serverUrl": "https://x.example/mcp"}]}',
+                 "ask", ", with only these MCP servers: aws-pricing, https://x.example/mcp."),
+            )
+            for settings, decision, needle in cases:
+                with self.subTest(settings=settings):
+                    shutil.rmtree(folder, ignore_errors=True)
+                    self.make_scratch(folder, settings)
+                    self.expect(self.bash(self.good(folder)), decision, needle)
+            # A folder made by the same command has no settings file yet.
             new = os.path.join(self.home, "not-yet")
-            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "allow")
+            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "deny", MCP_ON)
+
+        def test_links_out_of_the_scratch_folder_are_blocked(self):
+            claude_home = os.path.join(self.home, ".claude")
+            commands = os.path.join(claude_home, "commands")
+            os.makedirs(commands, exist_ok=True)
+            # .claude/ linked to ~/.claude: its settings file passes, but the copies land in ~/.claude.
+            settings = os.path.join(claude_home, "settings.json")
+            with open(settings, "w") as f:
+                f.write('{"allowedMcpServers": []}')
+            try:
+                linked = os.path.join(self.home, "linked")
+                os.makedirs(linked)
+                os.symlink(claude_home, os.path.join(linked, ".claude"))
+                self.expect(self.bash(self.good(linked)), "deny", "leads through a link to " + commands)
+            finally:
+                os.remove(settings)
+            # Only .claude/commands/ linked.
+            part = os.path.join(self.home, "part")
+            self.make_scratch(part)
+            os.symlink(commands, os.path.join(part, ".claude", "commands"))
+            self.expect(self.bash(self.good(part)), "deny", "leads through a link to " + commands)
+
+        def test_required_options_and_help(self):
+            base = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts."
+            self.expect(self.bash(base + "run_loop --num-workers 1 --eval-set e.json --skill-path x"),
+                        "deny", "`--model` is missing, which run_loop requires")
+            self.expect(self.bash(base + "run_eval --num-workers 1"),
+                        "deny", "`--eval-set` and `--skill-path` are missing, which run_eval requires")
+            # --help prints the usage and exits before any session or skill copy: no worker, folder,
+            # MCP or required-option check and nothing to confirm. Bytecode still counts, because
+            # Python imports the scripts package first.
+            self.expect(self.bash(base + "run_loop --help"), "allow")
+            self.expect(self.bash(base + "run_eval -h"), "allow")
+            self.expect(self.bash(base + "run_eval --he"), "allow")
+            self.expect(self.bash(f"cd {self.cache} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --help"),
+                        "allow")
+            self.expect(self.bash(f"cd {self.cache} && python3 -m scripts.run_eval --help"), "deny", self.BYTECODE)
+            # In run_loop --h also matches --holdout, so argparse rejects it as ambiguous; not help.
+            self.expect(self.bash(base + "run_loop --num-workers 1 --h"), "deny", "`--eval-set`")
+
+        def test_counts_below_one_start_nothing(self):
+            loop = (f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 1 "
+                    "--eval-set e.json --skill-path x --model m1 ")
+            for extra, needle in ((" --runs-per-query -1", "`--runs-per-query` must be a whole number of 1 or more, "
+                                                           "not `-1`"),
+                                  (" --runs-per-query 0", "not `0`"),
+                                  (" --runs=abc", "not `abc`")):
+                with self.subTest(extra=extra):
+                    self.expect(self.bash(self.good() + extra), "deny", needle)
+            self.expect(self.bash(loop + "--max-iterations -1"),
+                        "deny", "`--max-iterations` must be a whole number of 1 or more, not `-1`")
+            self.expect(self.bash(loop + "--max-iterations 0 --runs-per-query 0"), "deny", "`--max-iterations`")
+            # A count of 1 or more still gets the prompt.
+            self.expect(self.bash(loop.replace("run_loop", "run_eval") + "--runs-per-query 2"),
+                        "ask", "run_eval starts 8 test sessions (4 queries × 2 runs), on m1")
 
         def test_quoted_cd_paths_count(self):
             spaced = os.path.join(self.home, "scratch dir")
-            os.makedirs(os.path.join(spaced, ".claude"), exist_ok=True)
-            self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "allow")
+            self.make_scratch(spaced)
+            self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "ask")
             self.expect(self.bash(f"cd '{self.cache}' && {self.RUN}"), "deny", "it runs inside")
 
         def test_another_projects_run_eval_is_not_skill_creators(self):
@@ -816,7 +1114,7 @@ def run_self_tests() -> int:
             self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "deny", self.BYTECODE)
             # Inherited from the environment, then removed.
             inherited = {"PYTHONDONTWRITEBYTECODE": "1"}
-            self.expect(self.bash(no_env, extra_env=inherited), "allow")
+            self.expect(self.bash(no_env, extra_env=inherited), "ask")
             self.expect(self.bash(no_env.replace("python3", "env -u PYTHONDONTWRITEBYTECODE python3"),
                                   extra_env=inherited), "deny", self.BYTECODE)
             self.expect(self.bash(no_env.replace("python3", "env -i python3"), extra_env=inherited),
@@ -880,14 +1178,15 @@ def run_self_tests() -> int:
             self.expect(self.bash(f"cat <<'EOF'\n$({run10})\nEOF"), "allow")
 
         def test_env_options_are_modeled(self):
-            run = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --num-workers 1"
+            run = ("PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --num-workers 1 --eval-set e.json "
+                   "--skill-path x")
             self.expect(self.bash(f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 env -i python3 -m scripts.run_eval "
                                   "--num-workers 1"), "deny", self.BYTECODE)
-            self.expect(self.bash(f"cd {self.scratch} && env -i {run}"), "allow")
+            self.expect(self.bash(f"cd {self.scratch} && env -i {run}"), "ask")
             self.need_git()
             self.expect(self.bash(f"env -C {self.repo_claude} {run}"), "deny", self.GIT)
             self.expect(self.bash(f"env --chdir={self.repo_claude} {run}"), "deny", self.GIT)
-            self.expect(self.bash(f"env -C {self.scratch} {run}", cwd=self.repo_claude), "allow")
+            self.expect(self.bash(f"env -C {self.scratch} {run}", cwd=self.repo_claude), "ask")
 
         def test_substitution_runs_where_it_is(self):
             self.need_git()
@@ -921,6 +1220,10 @@ def run_self_tests() -> int:
         def test_rules_follow_skill_creator_only(self):
             for name in ("skill-creator:skill-creator", "anthropic-skills:skill-creator"):
                 self.expect(self.skill(name), "context", "--num-workers 1")
+                self.expect(self.skill(name), "context", "`claude -p exited`")
+                self.expect(self.skill(name), "context", "Pass `--max-iterations 3` to `run_loop`")
+                self.expect(self.skill(name), "context", "Avoid repeated status checks while an eval runs")
+                self.expect(self.skill(name), "context", '{"allowedMcpServers": []}')
             self.expect(self.skill("plugin-freshness:plugin-freshness"), "allow")
 
         def test_other_events_and_garbage_are_ignored(self):

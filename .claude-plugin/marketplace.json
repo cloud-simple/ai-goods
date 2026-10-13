@@ -15,7 +15,7 @@
     {
       "name": "skill-creator-guard",
       "source": "./plugins/skill-creator-guard",
-      "description": "Hooks that keep skill-creator's trigger evals honest: one worker at a time, run from a scratch folder, no bytecode in the plugin cache"
+      "description": "Hooks that keep skill-creator's trigger evals honest: one worker at a time, run from a scratch folder with MCP servers off, no bytecode in the plugin cache, and a confirmation that shows how many claude -p sessions a run starts"
     }
   ]
 }
