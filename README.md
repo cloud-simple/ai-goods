@@ -97,6 +97,11 @@ The `Bash` hook reads the command the way a shell splits it:
 - **What counts as a run:** `python -m scripts.run_eval`, a path to `run_eval.py`, or the script run
   directly, also behind `env`, `nohup`, `uv run` or `bash -c`.
 - **What it checks:** workers, bytecode and folder, against that command only.
+- **Whose script it is:** a script that resolves to a file counts only when its skill folder's
+  `SKILL.md` says `name: skill-creator`, so another project's own `scripts/run_eval.py` passes. A
+  script it can't resolve still counts.
+- **Folder it can't work out:** a run whose folder depends on something it can't know, such as an
+  unset variable or `cd -`, is blocked. Write the scratch folder as a literal path.
 
 Text that only mentions the script, such as an `echo`, a `claude -p` prompt, a commit message or a
 comment, passes, and so does every other command. If the hook itself fails, the command goes ahead.

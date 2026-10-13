@@ -15,14 +15,17 @@ Two events, wired in the skill-creator-guard plugin's hooks/hooks.json:
   PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule.
 
 The Bash check parses the command the way a shell splits it: quotes, escapes, comments, heredocs,
-separators, ( ) subshells, redirects and $( ) substitutions. It walks the simple commands in order,
-tracking the working directory (cd, uv run --directory), exported variables and folders made by
-mkdir. A command counts as an eval run only when it starts run_eval or run_loop itself; text in an
-echo, a prompt, a commit message or a comment does not. Workers, bytecode and location are checked
-against that command alone. This guards against mistakes, not against deliberate evasion: eval,
-source, a script written to a file and python -c are not followed.
+separators, ( ) subshells, redirects (with their file-descriptor numbers), and $( ) and backtick
+substitutions, each analyzed where it runs. It walks the simple commands in order, tracking the
+working directory (cd, uv run --directory), shell and exported variables (assignment, export, unset,
+env -u / -i) and folders made by mkdir. A command counts as an eval run only when it starts
+skill-creator's run_eval or run_loop itself: text in an echo, a prompt, a commit message or a comment
+does not, and neither does another project's own scripts/run_eval.py. Workers, bytecode and folder
+are checked against that command alone; a run whose folder cannot be worked out is blocked.
 
-Any error inside the hook lets the tool call go ahead: the hook must never block unrelated work.
+This guards against mistakes, not deliberate evasion: eval, source, python -c and scripts written to
+a file are not followed. Any error inside the hook lets the tool call go ahead: the hook must never
+block unrelated work because of its own failure.
 
 Self-tests:  python3 skill_creator_guard.py --test
 They build a throwaway home folder and run this script as a separate process with HOME pointed at
@@ -44,12 +47,13 @@ that always triggers scores about 1 in the number of workers.
 - Run them from a scratch directory that has its own empty `.claude/` folder. Never run them from inside \
 the plugin cache, a repository or the home directory: the scripts write their skill copies to the \
 nearest parent folder that has `.claude/`, and from the plugin cache that is `~/.claude`, so the \
-copies appear in every running Claude Code session.
+copies appear in every running Claude Code session. Write the folder as a literal path in the same \
+command, so the hook can check it.
 - Point Python at the scripts with `PYTHONPATH` and set `PYTHONDONTWRITEBYTECODE=1`, so no \
 `__pycache__` folder lands in the plugin cache:
 
-  mkdir -p "$SCRATCH/trigger/.claude" && cd "$SCRATCH/trigger" && \\
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="<skill-creator skill dir>" \\
+  mkdir -p <scratch dir>/.claude && cd <scratch dir> && \\
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<skill-creator skill dir> \\
     python3 -m scripts.run_eval --eval-set <evals.json> --skill-path <skill dir> --num-workers 1 --verbose
 
 - Treat a low trigger rate from a parallel run as unproven. Confirm it with `--num-workers 1` before \
@@ -57,8 +61,7 @@ changing a description.
 
 The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules."""
 
-EVAL_FILES = {"run_eval.py", "run_loop.py"}
-EVAL_MODULES = {"run_eval", "run_loop"}
+EVAL_SCRIPTS = ("run_eval", "run_loop")
 PYTHON = re.compile(r"python[0-9.]*")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 WRAPPERS = {"nohup", "time", "command", "exec", "builtin"}
@@ -66,13 +69,18 @@ KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
 ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 SEPARATORS = {";", "&&", "||", "|", "|&", "&", "\n", ";;"}
 REDIRECTS = {">", ">>", "<", "<>", ">|", "&>", "&>>", ">&", "<&"}
+# Operators an IO number can precede, as in 2>log or 3<&0.
+FD_OPERATORS = {">", ">>", "<", "<>", ">|", ">&", "<&", "<<", "<<-", "<<<"}
 # Longest first, so "<<<" wins over "<<" and "&&" over "&".
 OPERATORS = ["<<<", "&>>", "<<-", "&&", "||", ";;", "|&", ">>", "<<", ">&", "<&", "&>", "<>", ">|",
              ";", "&", "|", "(", ")", "<", ">"]
 UV_VALUE_OPTIONS = {"--with", "--with-requirements", "--with-editable", "--python", "-p", "--directory",
                     "--project", "--env-file", "--extra", "--group", "--package", "--index", "--index-url",
                     "--from"}
+SKILL_NAME = re.compile(r"^name:\s*['\"]?skill-creator['\"]?\s*$", re.M)
 MAX_DEPTH = 6
+UNKNOWN_FOLDER = ("its folder cannot be worked out from the command; write the scratch folder as a "
+                  "literal path, or set the variable in the same command")
 
 
 def emit(obj) -> None:
@@ -103,29 +111,47 @@ def read_paren(text: str, i: int) -> tuple:
     return text[i:], n
 
 
-def tokenize(text: str) -> tuple:
-    """Split shell text into tokens: ("w", word) with quotes removed, ("op", operator) and
-    ("heredoc", body). Also return the bodies of $( ) and backtick substitutions."""
-    tokens, subs = [], []
-    word, in_word = [], False
+def tokenize(text: str) -> list:
+    """Split shell text into tokens (kind, value, subs):
+
+      ("w", word, [substitution bodies])  a word with quotes removed
+      ("op", operator, [])                a separator, paren or redirect
+      ("heredoc", body, [])               the body of the heredoc started on the line before
+      ("herestring", word, [subs])        the word after <<<
+    """
+    tokens = []
+    word, subs, in_word, quoted = [], [], False, False
     pending = []           # heredoc delimiters waiting for the next newline: (word, strip tabs)
     delim_next = None      # set when the next word is a heredoc delimiter
     herestring_next = False
     i, n = 0, len(text)
 
     def end_word():
-        nonlocal word, in_word, delim_next, herestring_next
+        nonlocal word, subs, in_word, quoted, delim_next, herestring_next
         if in_word:
             w = "".join(word)
             if delim_next is not None:
                 pending.append((w, delim_next))
                 delim_next = None
             elif herestring_next:
-                tokens.append(("herestring", w))
+                tokens.append(("herestring", w, subs))
                 herestring_next = False
             else:
-                tokens.append(("w", w))
-        word, in_word = [], False
+                tokens.append(("w", w, subs))
+        word, subs, in_word, quoted = [], [], False, False
+
+    def substitution(i):
+        body, j = read_paren(text, i + 2)
+        subs.append(body)
+        word.append("$(" + body + ")")
+        return j
+
+    def backtick(i):
+        j = text.find("`", i + 1)
+        j = n if j < 0 else j
+        subs.append(text[i + 1:j])
+        word.append(text[i:j + 1])
+        return j + 1
 
     while i < n:
         c = text[i]
@@ -134,7 +160,7 @@ def tokenize(text: str) -> tuple:
             i += 1
         elif c == "\n":
             end_word()
-            tokens.append(("op", "\n"))
+            tokens.append(("op", "\n", []))
             i += 1
             for delim, strip in pending:
                 body = []
@@ -146,7 +172,7 @@ def tokenize(text: str) -> tuple:
                     if (line.lstrip("\t") if strip else line) == delim:
                         break
                     body.append(line)
-                tokens.append(("heredoc", "\n".join(body)))
+                tokens.append(("heredoc", "\n".join(body), []))
             pending = []
         elif c == "#" and not in_word:
             j = text.find("\n", i)
@@ -156,16 +182,16 @@ def tokenize(text: str) -> tuple:
                 i += 2
             else:
                 word.append(text[i + 1:i + 2])
-                in_word = True
+                in_word = quoted = True
                 i += 2
         elif c == "'":
             j = text.find("'", i + 1)
             j = n if j < 0 else j
             word.append(text[i + 1:j])
-            in_word = True
+            in_word = quoted = True
             i = j + 1
         elif c == '"':
-            in_word = True
+            in_word = quoted = True
             i += 1
             while i < n and text[i] != '"':
                 if text[i] == "\\" and i + 1 < n and text[i + 1] in '"\\$`\n':
@@ -173,31 +199,19 @@ def tokenize(text: str) -> tuple:
                         word.append(text[i + 1])
                     i += 2
                 elif text.startswith("$(", i):
-                    body, i = read_paren(text, i + 2)
-                    subs.append(body)
-                    word.append("$(" + body + ")")
+                    i = substitution(i)
                 elif text[i] == "`":
-                    j = text.find("`", i + 1)
-                    j = n if j < 0 else j
-                    subs.append(text[i + 1:j])
-                    word.append(text[i:j + 1])
-                    i = j + 1
+                    i = backtick(i)
                 else:
                     word.append(text[i])
                     i += 1
             i += 1
         elif text.startswith("$(", i):
-            body, i = read_paren(text, i + 2)
-            subs.append(body)
-            word.append("$(" + body + ")")
             in_word = True
+            i = substitution(i)
         elif c == "`":
-            j = text.find("`", i + 1)
-            j = n if j < 0 else j
-            subs.append(text[i + 1:j])
-            word.append(text[i:j + 1])
             in_word = True
-            i = j + 1
+            i = backtick(i)
         else:
             op = next((o for o in OPERATORS if text.startswith(o, i)), None)
             if op is None:
@@ -205,16 +219,18 @@ def tokenize(text: str) -> tuple:
                 in_word = True
                 i += 1
                 continue
+            if op in FD_OPERATORS and in_word and not quoted and "".join(word).isdigit():
+                word, subs, in_word = [], [], False  # an IO number such as the 2 in 2>log, not a word
             end_word()
             if op in ("<<", "<<-"):
                 delim_next = op == "<<-"
             elif op == "<<<":
                 herestring_next = True
             else:
-                tokens.append(("op", op))
+                tokens.append(("op", op, []))
             i += len(op)
     end_word()
-    return tokens, subs
+    return tokens
 
 
 # ---------------------------------------------------------------- paths
@@ -243,20 +259,34 @@ def nearest_existing(path: str) -> str:
 
 
 class Ctx:
-    """What the shell knows at one point: working directory (None when unknown), exported variables,
-    and the folders mkdir has made so far (shared across the whole command)."""
+    """What the shell knows at one point: the working directory (None when unknown), shell variables,
+    exported variables, inherited variables removed by unset, and the folders mkdir has made so far
+    (shared across the whole command)."""
 
-    def __init__(self, cwd, exports, created):
-        self.cwd, self.exports, self.created = cwd, exports, created
+    def __init__(self, cwd, created):
+        self.cwd, self.created = cwd, created
+        self.vars, self.exports, self.unset = {}, {}, set()
 
     def copy(self):
-        return Ctx(self.cwd, dict(self.exports), self.created)
+        c = Ctx(self.cwd, self.created)
+        c.vars, c.exports, c.unset = dict(self.vars), dict(self.exports), set(self.unset)
+        return c
+
+    def child_env(self, prefix=None, removed=(), clean=False) -> dict:
+        """The environment a program started here sees."""
+        env = {} if clean else {k: v for k, v in os.environ.items() if k not in self.unset}
+        if not clean:
+            env.update(self.exports)
+        env.update(prefix or {})
+        for name in removed:
+            env.pop(name, None)
+        return env
 
 
 def expand(word: str, ctx: Ctx, extra=None):
     """Expand ~ and $VAR / ${VAR}. Return None when a variable is unknown."""
-    values = dict(os.environ)
-    values.update(ctx.exports)
+    values = ctx.child_env()
+    values.update(ctx.vars)
     values.update(extra or {})
     unknown = []
 
@@ -273,17 +303,18 @@ def expand(word: str, ctx: Ctx, extra=None):
     return os.path.expanduser(out)
 
 
-def resolve(word, ctx: Ctx, extra=None):
+def resolve(word, ctx: Ctx, extra=None, cwd=None):
     """The absolute path a word names, relative to the tracked cwd, or None when it cannot be known."""
     if word is None:
         return home_dir()
     path = expand(word, ctx, extra)
     if path is None:
         return None
+    base = cwd if cwd is not None else ctx.cwd
     if not os.path.isabs(path):
-        if ctx.cwd is None:
+        if base is None:
             return None
-        path = os.path.join(ctx.cwd, path)
+        path = os.path.join(base, path)
     return real(os.path.normpath(path))
 
 
@@ -327,6 +358,17 @@ def location_problem(directory: str, created: set):
     return None
 
 
+def is_skill_creator(script_path: str) -> bool:
+    """Whether a run_eval.py / run_loop.py file belongs to skill-creator: its skill folder (the parent
+    of scripts/) holds a SKILL.md whose frontmatter says name: skill-creator."""
+    skill_md = os.path.join(os.path.dirname(os.path.dirname(script_path)), "SKILL.md")
+    try:
+        with open(skill_md, encoding="utf-8") as f:
+            return bool(SKILL_NAME.search(f.read(4096)))
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------- command analysis
 
 def workers_value(args: list):
@@ -340,12 +382,13 @@ def workers_value(args: list):
     return value
 
 
-def eval_args(argv: list):
-    """When argv starts run_eval or run_loop, return (its arguments, whether python -B is set).
-    Otherwise None."""
+def eval_target(argv: list):
+    """When argv starts a run_eval / run_loop script, return (kind, target, args, python -B set),
+    where kind is "file" (target is the path as written) or "module" (target is the module name).
+    Otherwise None. Provenance is checked separately."""
     name = os.path.basename(argv[0])
-    if name in EVAL_FILES:
-        return argv[1:], False
+    if name.endswith(".py") and name[:-3] in EVAL_SCRIPTS:
+        return "file", argv[0], argv[1:], False
     if not PYTHON.fullmatch(name):
         return None
     no_bytecode, j = False, 1
@@ -367,10 +410,8 @@ def eval_args(argv: list):
                 if f == "c":
                     return None
                 if f == "m":
-                    module = value.rsplit(".", 1)[-1]
-                    if module in EVAL_MODULES and value in (module, "scripts." + module) \
-                            or value.endswith(".scripts." + module) and module in EVAL_MODULES:
-                        return argv[j + consumed:], no_bytecode
+                    if value.rsplit(".", 1)[-1] in EVAL_SCRIPTS:
+                        return "module", value, argv[j + consumed:], no_bytecode
                     return None
                 j += consumed - 1
                 break
@@ -378,8 +419,36 @@ def eval_args(argv: list):
         j += 1
     if j < len(argv) and argv[j] == "--":
         j += 1
-    if j < len(argv) and os.path.basename(argv[j]) in EVAL_FILES:
-        return argv[j + 1:], no_bytecode
+    if j < len(argv):
+        base = os.path.basename(argv[j])
+        if base.endswith(".py") and base[:-3] in EVAL_SCRIPTS:
+            return "file", argv[j], argv[j + 1:], no_bytecode
+    return None
+
+
+def belongs_to_skill_creator(kind: str, target: str, ctx: Ctx, cwd, env: dict) -> bool:
+    """False only when the script resolves to a file outside a skill-creator skill folder, so another
+    project's own run_eval.py passes. A script that cannot be resolved still counts."""
+    if kind == "file":
+        path = resolve(target, ctx, env, cwd)
+        candidates = [path] if path else []
+    else:
+        rel = target.replace(".", os.sep) + ".py"
+        roots = [cwd] + [resolve(p, ctx, env, cwd) for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+        candidates = [os.path.join(r, rel) for r in roots if r]
+    for path in candidates:
+        if os.path.isfile(path):
+            return is_skill_creator(path)
+    return True
+
+
+def shell_script(argv: list):
+    """For bash -c / -lc / -ec ... return the script text, else None."""
+    for k, a in enumerate(argv[1:], start=1):
+        if a == "--" or not a.startswith("-"):
+            return None
+        if not a.startswith("--") and "c" in a[1:]:
+            return argv[k + 1] if k + 1 < len(argv) else None
     return None
 
 
@@ -394,10 +463,9 @@ class Analyzer:
     def script(self, text: str, ctx: Ctx, depth: int = 0) -> None:
         if depth > MAX_DEPTH:
             return
-        tokens, subs = tokenize(text)
         stack = [ctx]
         argv, redirect_next, herestring = [], False, None
-        last = None  # (shell?, ctx) of the command a following heredoc belongs to
+        last = None  # (shell reading stdin?, ctx) of the command a following heredoc belongs to
 
         def finish():
             nonlocal argv, herestring, last
@@ -407,7 +475,10 @@ class Analyzer:
                     self.script(herestring, last[1].copy(), depth + 1)
             argv, herestring = [], None
 
-        for kind, value in tokens:
+        for kind, value, subs in tokenize(text):
+            # A substitution runs where its word is, before the command around it.
+            for body in subs:
+                self.script(body, stack[-1].copy(), depth + 1)
             if kind == "w":
                 if redirect_next:
                     redirect_next = False
@@ -430,28 +501,44 @@ class Analyzer:
             elif value in REDIRECTS:
                 redirect_next = True
         finish()
-        for body in subs:
-            self.script(body, stack[0].copy(), depth + 1)
 
-    def command(self, argv: list, ctx: Ctx, depth: int, env=None):
+    def command(self, argv: list, ctx: Ctx, depth: int, env=None, removed=(), clean=False):
         """Analyze one simple command. Return (is a shell reading stdin, ctx) for heredoc routing."""
-        env = dict(env or {})
+        env, removed = dict(env or {}), set(removed)
         i = 0
         while i < len(argv) and (ASSIGN.fullmatch(argv[i]) or argv[i] in KEYWORDS):
             if ASSIGN.fullmatch(argv[i]):
                 key, _, value = argv[i].partition("=")
-                env[key] = value
+                env[key] = expand(value, ctx, env) or value
             i += 1
         argv = argv[i:]
+        if not argv:
+            # A bare assignment sets a shell variable; it reaches children only if exported.
+            for key, value in env.items():
+                ctx.vars[key] = value
+                if key in ctx.exports:
+                    ctx.exports[key] = value
+            return None
         while argv:
             name = os.path.basename(argv[0])
             if name == "env":
                 j = 1
                 while j < len(argv) and (argv[j].startswith("-") or ASSIGN.fullmatch(argv[j])):
-                    if ASSIGN.fullmatch(argv[j]):
-                        key, _, value = argv[j].partition("=")
+                    a = argv[j]
+                    if ASSIGN.fullmatch(a):
+                        key, _, value = a.partition("=")
                         env[key] = value
-                    j += 2 if argv[j] in ("-u", "--unset", "-C", "--chdir") else 1
+                    elif a in ("-i", "--ignore-environment", "-"):
+                        clean = True
+                    elif a in ("-u", "--unset") and j + 1 < len(argv):
+                        removed.add(argv[j + 1])
+                        env.pop(argv[j + 1], None)
+                        j += 1
+                    elif a.startswith("--unset="):
+                        removed.add(a.split("=", 1)[1])
+                    elif a in ("-C", "--chdir"):
+                        j += 1
+                    j += 1
                 argv = argv[j:]
             elif name in WRAPPERS:
                 argv = argv[1:]
@@ -474,13 +561,18 @@ class Analyzer:
             return None
         if name == "export":
             for a in argv[1:]:
-                if ASSIGN.fullmatch(a):
-                    key, _, value = a.partition("=")
-                    ctx.exports[key] = expand(value, ctx, env) or value
+                key, eq, value = a.partition("=")
+                if eq:
+                    ctx.exports[key] = ctx.vars[key] = expand(value, ctx, env) or value
+                elif key in ctx.vars:
+                    ctx.exports[key] = ctx.vars[key]
+                ctx.unset.discard(key)
             return None
         if name == "unset":
             for a in argv[1:]:
                 ctx.exports.pop(a, None)
+                ctx.vars.pop(a, None)
+                ctx.unset.add(a)
             return None
         if name == "mkdir":
             j = 1
@@ -496,8 +588,9 @@ class Analyzer:
                 j += 1
             return None
         if name in SHELLS:
-            if "-c" in argv[1:-1]:
-                self.script(argv[argv.index("-c") + 1], ctx.copy(), depth + 1)
+            body = shell_script(argv)
+            if body is not None:
+                self.script(body, ctx.copy(), depth + 1)
                 return None
             return (True, ctx.copy())
         if name == "uv" and argv[1:2] == ["run"]:
@@ -509,12 +602,15 @@ class Analyzer:
                 j += 1 if eq or key not in UV_VALUE_OPTIONS else 2
             if j < len(argv) and argv[j] == "--":
                 j += 1
-            return self.command(argv[j:], sub, depth, env) if j < len(argv) else None
+            return self.command(argv[j:], sub, depth, env, removed, clean) if j < len(argv) else None
 
-        found = eval_args(argv)
+        found = eval_target(argv)
         if found is None:
             return None
-        args, no_bytecode = found
+        kind, target, args, no_bytecode = found
+        child = ctx.child_env(env, removed, clean)
+        if ctx.cwd is not None and not belongs_to_skill_creator(kind, target, ctx, ctx.cwd, child):
+            return None  # another project's own run_eval.py
         value = workers_value(args)
         try:
             one = value is not None and int(value) == 1
@@ -522,12 +618,11 @@ class Analyzer:
             one = False
         if not one:
             self.add("`--num-workers 1` is missing")
-        merged = dict(os.environ)
-        merged.update(ctx.exports)
-        merged.update(env)
-        if not (no_bytecode or merged.get("PYTHONDONTWRITEBYTECODE")):
+        if not (no_bytecode or child.get("PYTHONDONTWRITEBYTECODE")):
             self.add("`PYTHONDONTWRITEBYTECODE=1` is not set")
-        if ctx.cwd is not None:
+        if ctx.cwd is None:
+            self.add(UNKNOWN_FOLDER)
+        else:
             where = location_problem(ctx.cwd, ctx.created)
             if where:
                 self.add(where)
@@ -541,8 +636,7 @@ def pre_tool_use(data: dict) -> None:
     if not re.search(r"run_(?:eval|loop)", command):
         return  # fast path: nothing to parse
     analyzer = Analyzer()
-    cwd = data.get("cwd") or os.getcwd()
-    analyzer.script(command, Ctx(real(cwd), {}, set()))
+    analyzer.script(command, Ctx(real(data.get("cwd") or os.getcwd()), set()))
     if not analyzer.problems:
         return
     emit({"hookSpecificOutput": {
@@ -576,26 +670,35 @@ def run_self_tests() -> int:
             cls.cache = os.path.join(home, ".claude", "plugins", "cache", "claude-plugins-official",
                                      "skill-creator", "abc123", "skills", "skill-creator")
             os.makedirs(os.path.join(cls.cache, "scripts"))
-            open(os.path.join(cls.cache, "scripts", "run_eval.py"), "w").close()
+            for script in ("run_eval.py", "run_loop.py"):
+                open(os.path.join(cls.cache, "scripts", script), "w").close()
+            with open(os.path.join(cls.cache, "SKILL.md"), "w") as f:
+                f.write("---\nname: skill-creator\ndescription: x\n---\n")
             cls.scratch = os.path.join(home, "scratch")             # the right place: its own .claude/
             os.makedirs(os.path.join(cls.scratch, ".claude"))
             cls.repo_plain = os.path.join(home, "work", "repo")      # a repo without .claude/
             cls.repo_claude = os.path.join(home, "work", "repo2")    # a repo with its own .claude/
+            cls.other = os.path.join(home, "work", "other")          # another project's own run_eval.py
             os.makedirs(cls.repo_plain)
             os.makedirs(os.path.join(cls.repo_claude, ".claude"))
+            os.makedirs(os.path.join(cls.other, "scripts"))
+            open(os.path.join(cls.other, "scripts", "run_eval.py"), "w").close()
+            with open(os.path.join(cls.other, "SKILL.md"), "w") as f:
+                f.write("---\nname: something-else\n---\n")
             cls.has_git = shutil.which("git") is not None
             if cls.has_git:
-                for repo in (cls.repo_plain, cls.repo_claude):
+                for repo in (cls.repo_plain, cls.repo_claude, cls.other):
                     subprocess.run(["git", "init", "-q", repo], check=True)
 
         @classmethod
         def tearDownClass(cls):
             shutil.rmtree(cls.tmp, ignore_errors=True)
 
-        def hook(self, payload, raw=None):
+        def hook(self, payload, raw=None, extra_env=None):
             """Run this script the way Claude Code does: JSON on stdin, HOME set to the fake home."""
-            env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+            env = {k: v for k, v in os.environ.items() if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPATH")}
             env["HOME"] = self.home
+            env.update(extra_env or {})
             p = subprocess.run([sys.executable, os.path.abspath(__file__)],
                                input=raw if raw is not None else json.dumps(payload),
                                capture_output=True, text=True, env=env, timeout=30)
@@ -607,15 +710,19 @@ def run_self_tests() -> int:
             return (spec.get("permissionDecision", "context"),
                     spec.get("permissionDecisionReason") or spec.get("additionalContext", ""))
 
-        def bash(self, command, cwd=None):
+        def bash(self, command, cwd=None, extra_env=None):
             return self.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                              "cwd": cwd or self.scratch, "tool_input": {"command": command}})
+                              "cwd": cwd or self.scratch, "tool_input": {"command": command}},
+                             extra_env=extra_env)
 
         def skill(self, name):
             return self.hook({"hook_event_name": "PostToolUse", "tool_name": "Skill",
                               "cwd": self.scratch, "tool_input": {"skill": name}})
 
         RUN = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --eval-set e.json --skill-path x --num-workers 1"
+        MISSING = "`--num-workers 1` is missing"
+        BYTECODE = "`PYTHONDONTWRITEBYTECODE=1` is not set"
+        GIT = "inside a git repository"
 
         def good(self, where=None):
             return f"cd {where or self.scratch} && {self.RUN}"
@@ -623,6 +730,10 @@ def run_self_tests() -> int:
         def expect(self, result, decision, needle=""):
             self.assertEqual(result[0], decision, result[1][:300])
             self.assertIn(needle, result[1])
+
+        def need_git(self):
+            if not self.has_git:
+                self.skipTest("git is not installed")
 
         # Allowed runs.
 
@@ -638,6 +749,7 @@ def run_self_tests() -> int:
             self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "allow")
             self.expect(self.bash(f'cd "{self.scratch}" && PYTHONDONTWRITEBYTECODE=1 '
                                   f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1'), "allow")
+            self.expect(self.bash(f"S={self.scratch}; cd \"$S\" && {self.RUN}"), "allow")
 
         def test_folder_created_by_the_same_command_is_allowed(self):
             new = os.path.join(self.home, "not-yet")
@@ -649,43 +761,59 @@ def run_self_tests() -> int:
             self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "allow")
             self.expect(self.bash(f"cd '{self.cache}' && {self.RUN}"), "deny", "it runs inside")
 
+        def test_another_projects_run_eval_is_not_skill_creators(self):
+            self.need_git()
+            self.expect(self.bash(f"cd {self.other} && ./scripts/run_eval.py --num-workers 10"), "allow")
+            self.expect(self.bash(f"cd {self.other} && python3 -m scripts.run_eval"), "allow")
+            # The same module name pointed at skill-creator's copy is still checked.
+            self.expect(self.bash(f"cd {self.other} && PYTHONPATH={self.cache} python3 -m scripts.run_eval"),
+                        "allow")  # cwd comes first on sys.path, so this still runs the other project's copy
+            self.expect(self.bash(f"cd {self.repo_plain} && PYTHONPATH={self.cache} python3 -m scripts.run_eval"),
+                        "deny", self.MISSING)
+
         # Blocked runs.
 
         def test_parallel_runs_are_blocked(self):
-            missing = "`--num-workers 1` is missing"
-            self.expect(self.bash(self.good().replace(" --num-workers 1", "")), "deny", missing)
-            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers 12")), "deny", missing)
-            self.expect(self.bash(self.good() + " --num-workers 4"), "deny", missing)  # the last one wins
+            self.expect(self.bash(self.good().replace(" --num-workers 1", "")), "deny", self.MISSING)
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers 12")), "deny", self.MISSING)
+            self.expect(self.bash(self.good() + " --num-workers 4"), "deny", self.MISSING)  # the last one wins
             loop = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 10"
-            self.expect(self.bash(loop), "deny", missing)
+            self.expect(self.bash(loop), "deny", self.MISSING)
 
         def test_bytecode_must_be_off_for_the_eval_itself(self):
-            off = "`PYTHONDONTWRITEBYTECODE=1` is not set"
-            self.expect(self.bash(self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")), "deny", off)
-            # Set for another command only, or as a plain shell variable that is not exported.
             no_env = self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")
-            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1 echo x; {no_env}"), "deny", off)
-            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "deny", off)
+            self.expect(self.bash(no_env), "deny", self.BYTECODE)
+            # Set for another command only, or as a plain shell variable that is not exported.
+            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1 echo x; {no_env}"), "deny", self.BYTECODE)
+            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "deny", self.BYTECODE)
+            # Inherited from the environment, then removed.
+            inherited = {"PYTHONDONTWRITEBYTECODE": "1"}
+            self.expect(self.bash(no_env, extra_env=inherited), "allow")
+            self.expect(self.bash(no_env.replace("python3", "env -u PYTHONDONTWRITEBYTECODE python3"),
+                                  extra_env=inherited), "deny", self.BYTECODE)
+            self.expect(self.bash(no_env.replace("python3", "env -i python3"), extra_env=inherited),
+                        "deny", self.BYTECODE)
+            self.expect(self.bash(f"unset PYTHONDONTWRITEBYTECODE; {no_env}", extra_env=inherited),
+                        "deny", self.BYTECODE)
 
         def test_flags_elsewhere_do_not_count(self):
-            bare = f"cd {self.scratch} && python3 -m scripts.run_eval"
-            result = self.bash(f"echo --num-workers 1 PYTHONDONTWRITEBYTECODE=1; {bare}")
-            self.expect(result, "deny", "`--num-workers 1` is missing")
-            self.assertIn("`PYTHONDONTWRITEBYTECODE=1` is not set", result[1])
+            result = self.bash(f"echo --num-workers 1 PYTHONDONTWRITEBYTECODE=1; cd {self.scratch} && "
+                               "python3 -m scripts.run_eval")
+            self.expect(result, "deny", self.MISSING)
+            self.assertIn(self.BYTECODE, result[1])
 
         def test_every_way_of_starting_the_script_is_seen(self):
-            missing = "`--num-workers 1` is missing"
-            self.expect(self.bash(f"cd {self.cache} && ./scripts/run_eval.py --num-workers 10"), "deny", missing)
+            self.expect(self.bash(f"cd {self.cache} && ./scripts/run_eval.py --num-workers 10"), "deny", self.MISSING)
             self.expect(self.bash(f'PYTHONDONTWRITEBYTECODE=1 python3 "{self.cache}/scripts/run_eval.py"'),
-                        "deny", missing)
+                        "deny", self.MISSING)
             self.expect(self.bash(f'cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m "scripts.run_eval"'),
-                        "deny", missing)
+                        "deny", self.MISSING)
             bad = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval"
-            self.expect(self.bash(f'bash -c "{bad}"'), "deny", missing)
-            self.expect(self.bash(f"bash <<'EOF'\n{bad}\nEOF"), "deny", missing)
-            self.expect(self.bash(f"x=$({bad})"), "deny", missing)
-            self.expect(self.bash(f"cd {self.scratch} && nohup python3 -m scripts.run_eval > log 2>&1 &"),
-                        "deny", missing)
+            for wrapped in (f'bash -c "{bad}"', f'bash -lc "{bad}"', f'zsh -lc "{bad}"', f'sh -ec "{bad}"',
+                            f"bash <<'EOF'\n{bad}\nEOF", f"x=$({bad})",
+                            f"cd {self.scratch} && nohup python3 -m scripts.run_eval > log 2>&1 &"):
+                with self.subTest(wrapped=wrapped):
+                    self.expect(self.bash(wrapped), "deny", self.MISSING)
             uv = (f"PYTHONDONTWRITEBYTECODE=1 uv run --with anthropic --directory {self.cache} "
                   "python -m scripts.run_loop --num-workers 1")
             self.expect(self.bash(uv), "deny", "it runs inside")
@@ -697,18 +825,30 @@ def run_self_tests() -> int:
             # No cd: the hook's cwd decides. A repo without .claude/ sends the copies to the home folder.
             self.expect(self.bash(self.RUN, cwd=self.repo_plain), "deny", "home directory")
 
+        def test_unknown_folder_is_blocked(self):
+            self.expect(self.bash(f'cd "$NOT_SET" && {self.RUN}'), "deny", "cannot be worked out")
+            self.expect(self.bash(f"cd - && {self.RUN}"), "deny", "cannot be worked out")
+
         def test_repo_cases_are_blocked(self):
-            if not self.has_git:
-                self.skipTest("git is not installed")
-            git = "inside a git repository"
-            self.expect(self.bash(self.good(self.repo_claude)), "deny", git)
+            self.need_git()
+            self.expect(self.bash(self.good(self.repo_claude)), "deny", self.GIT)
             # A cd inside a subshell does not move the eval.
-            self.expect(self.bash(f"(cd {self.scratch}) && {self.RUN}", cwd=self.repo_claude), "deny", git)
+            self.expect(self.bash(f"(cd {self.scratch}) && {self.RUN}", cwd=self.repo_claude), "deny", self.GIT)
             # A cd on a later line does.
-            self.expect(self.bash(f"echo ok\ncd {self.repo_claude}\n{self.RUN}"), "deny", git)
+            self.expect(self.bash(f"echo ok\ncd {self.repo_claude}\n{self.RUN}"), "deny", self.GIT)
             # A folder made inside a repo is still inside the repo.
             new = os.path.join(self.repo_claude, "new")
-            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "deny", git)
+            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "deny", self.GIT)
+            # A shell variable carries the folder.
+            self.expect(self.bash(f'BAD={self.repo_claude}; cd "$BAD"; {self.RUN}'), "deny", self.GIT)
+            # An IO number before the command is not the command.
+            self.expect(self.bash(f"2>log {self.RUN}", cwd=self.repo_claude), "deny", self.GIT)
+
+        def test_substitution_runs_where_it_is(self):
+            self.need_git()
+            sub = f"cd {self.repo_claude}; x=$({self.RUN}); cd {self.scratch}"
+            self.expect(self.bash(sub), "deny", self.GIT)
+            self.expect(self.bash(f"cd {self.repo_claude}; echo \"`{self.RUN}`\"; cd {self.scratch}"), "deny", self.GIT)
 
         # Text that only mentions the script.
 
@@ -728,8 +868,8 @@ def run_self_tests() -> int:
 
         def test_quoted_heredoc_marker_hides_nothing(self):
             bad = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval"
-            self.expect(self.bash(f'echo "<<EOF"\n{bad}'), "deny", "`--num-workers 1` is missing")
-            self.expect(self.bash(f"cat <<EOF > notes.txt\nhello\nEOF\n{bad}"), "deny", "`--num-workers 1` is missing")
+            self.expect(self.bash(f'echo "<<EOF"\n{bad}'), "deny", self.MISSING)
+            self.expect(self.bash(f"cat <<EOF > notes.txt\nhello\nEOF\n{bad}"), "deny", self.MISSING)
 
         # The Skill hook and the rest.
 
@@ -745,14 +885,16 @@ def run_self_tests() -> int:
                         "allow")
 
         def test_tokenizer(self):
-            words = lambda s: [v for k, v in tokenize(s)[0] if k == "w"]
+            def words(s):
+                return [v for k, v, _ in tokenize(s) if k == "w"]
             self.assertEqual(words("a 'b c' \"d \\\" e\" f\\ g"), ["a", "b c", 'd " e', "f g"])
             self.assertEqual(words("a # b c"), ["a"])
             self.assertEqual(words("x=$(echo 'a b') y"), ["x=$(echo 'a b')", "y"])
-            toks, subs = tokenize("cat <<-EOF > f\n\tbody\n\tEOF\nnext")
-            self.assertIn(("heredoc", "\tbody"), toks)
-            self.assertEqual([v for k, v in toks if k == "w"], ["cat", "f", "next"])
-            self.assertEqual(tokenize("a `b c` d")[1], ["b c"])
+            self.assertEqual(words("2>log cmd 3<&0 '4'>x"), ["log", "cmd", "0", "4", "x"])
+            toks = tokenize("cat <<-EOF > f\n\tbody\n\tEOF\nnext")
+            self.assertIn(("heredoc", "\tbody", []), toks)
+            self.assertEqual(words("cat <<-EOF > f\n\tbody\n\tEOF\nnext"), ["cat", "f", "next"])
+            self.assertEqual([t[2] for t in tokenize("a `b c` d")], [[], ["b c"], []])
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
