@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "input=$(cat); d=$(printf '%s' \"$input\" | jq -r '.workspace.current_dir // .cwd'); b=$(git -C \"$d\" branch --show-current 2>/dev/null); [ -n \"$b\" ] || b=$(git -C \"$d\" rev-parse --short HEAD 2>/dev/null); gd=''; if [ -n \"$b\" ]; then for r in origin/HEAD origin/main origin/master main master; do if git -C \"$d\" rev-parse -q --verify \"$r^{commit}\" >/dev/null 2>&1; then gd=$(git -C \"$d\" diff --numstat \"$r...HEAD\" 2>/dev/null | awk '{a+=$1; x+=$2} END {printf \"+%d -%d\", a, x}'); break; fi; done; fi; printf '%s' \"$input\" | jq -r --arg b \"$b\" --arg gd \"$gd\" '[([.model.display_name, .effort.level] | map(select(. != null and . != \"\")) | join(\" \")), \"v\\(.version)\", (.session_name // \"unnamed\"), $b, $gd, (.rate_limits.five_hour.used_percentage // empty | \"current \\(100 - round)% left\"), (.rate_limits.seven_day.used_percentage // empty | \"weekly \\(100 - round)% left\"), \"ID: \\(.session_id[0:36])\", (if (env.CLAUDE_JOB_DIR // \"\") == \"\" then empty else \"BG\" end)] | map(select(. != \"\")) | join(\" · \")'"
+  }
+}
