@@ -18,6 +18,18 @@ From inside Claude Code:
 /plugin install skill-creator-guard@ai-goods
 ```
 
+From the command line:
+
+```bash
+claude plugin marketplace add cloud-simple/ai-goods
+claude plugin install plugin-freshness@ai-goods
+claude plugin install skill-creator-guard@ai-goods
+```
+
+Both install at user scope, for every project. Add `--scope project` to `claude plugin install` to install
+for the current project only. The `skill-creator-guard` hooks come with the plugin: installing it is
+the whole setup, with no `settings.json` change.
+
 ## plugin-freshness
 
 Ask "are my plugins up to date?" or "anything stale in my Claude Code setup?". The skill compares
