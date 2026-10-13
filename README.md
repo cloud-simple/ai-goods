@@ -142,8 +142,8 @@ in auto mode too. A session that cannot show a prompt, such as `claude -p`, deni
 Claude gets the size as the reason.
 
 The rules Claude gets when skill-creator loads cover the same ground: one worker, a scratch folder
-with MCP servers off, no bytecode, the cost of a run, one `run_eval` pass before any `run_loop`, and
-how to spot a round that failed sessions spoiled. They also set the `run_loop` options:
+with MCP servers off, no bytecode, the cost of a run, one `run_eval` pass before any `run_loop`, no
+repeated status checks while a run goes, and how to spot a round that failed sessions spoiled. They also set the `run_loop` options:
 
 | Option | Rule | Why |
 |---|---|---|
