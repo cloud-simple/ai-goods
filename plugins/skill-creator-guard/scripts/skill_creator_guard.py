@@ -483,13 +483,19 @@ def asks_for_help(args: list, script: str) -> bool:
     return any(a == "-h" or names_option(a, "--help", script) for a in args)
 
 
-def count_value(value, default: int) -> int:
+def positive(value) -> bool:
+    """Whether a count option is unset (the default applies) or a whole number of 1 or more."""
     if value is None:
-        return default
+        return True
     try:
-        return int(value)
+        return int(value) >= 1
     except ValueError:
-        return default  # argparse rejects it and the run starts nothing
+        return False
+
+
+def count_value(value, default: int) -> int:
+    """A count option checked by positive(), or its default when unset."""
+    return default if value is None else int(value)
 
 
 def eval_set_size(path):
@@ -791,12 +797,18 @@ class Analyzer:
                 problem, mcp = mcp_setting(project_root(ctx.cwd, ctx.created))
                 if problem:
                     self.add(problem)
-        missing =[f"`{o}`" for o in REQUIRED[script] if option_value(args, o, script) is None]
+        # A missing required option stops the script in argparse, and a count below 1 runs its loops
+        # zero times: either way no session starts, so there is no size to confirm.
+        missing = [f"`{o}`" for o in REQUIRED[script] if option_value(args, o, script) is None]
         if missing:
-            # argparse would stop the script before any session, so there is no size to confirm.
             self.add(f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} missing, which "
                      f"{script} requires")
-        else:
+        counts = ("--runs-per-query", "--max-iterations") if script == "run_loop" else ("--runs-per-query",)
+        bad = [o for o in counts if not positive(option_value(args, o, script))]
+        for option in bad:
+            self.add(f"`{option}` must be a whole number of 1 or more, not "
+                     f"`{option_value(args, option, script)}`")
+        if not (missing or bad):
             self.sizes.append(run_size(script, args, ctx, env, mcp))
         return None
 
@@ -1049,6 +1061,22 @@ def run_self_tests() -> int:
             self.expect(self.bash(f"cd {self.cache} && python3 -m scripts.run_eval --help"), "deny", self.BYTECODE)
             # In run_loop --h also matches --holdout, so argparse rejects it as ambiguous; not help.
             self.expect(self.bash(base + "run_loop --num-workers 1 --h"), "deny", "`--eval-set`")
+
+        def test_counts_below_one_start_nothing(self):
+            loop = (f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 1 "
+                    "--eval-set e.json --skill-path x --model m1 ")
+            for extra, needle in ((" --runs-per-query -1", "`--runs-per-query` must be a whole number of 1 or more, "
+                                                           "not `-1`"),
+                                  (" --runs-per-query 0", "not `0`"),
+                                  (" --runs=abc", "not `abc`")):
+                with self.subTest(extra=extra):
+                    self.expect(self.bash(self.good() + extra), "deny", needle)
+            self.expect(self.bash(loop + "--max-iterations -1"),
+                        "deny", "`--max-iterations` must be a whole number of 1 or more, not `-1`")
+            self.expect(self.bash(loop + "--max-iterations 0 --runs-per-query 0"), "deny", "`--max-iterations`")
+            # A count of 1 or more still gets the prompt.
+            self.expect(self.bash(loop.replace("run_loop", "run_eval") + "--runs-per-query 2"),
+                        "ask", "run_eval starts 8 test sessions (4 queries × 2 runs), on m1")
 
         def test_quoted_cd_paths_count(self):
             spaced = os.path.join(self.home, "scratch dir")
