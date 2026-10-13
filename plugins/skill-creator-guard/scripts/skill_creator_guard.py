@@ -767,15 +767,19 @@ class Analyzer:
         if ctx.cwd is not None and not belongs_to_skill_creator(kind, target, ctx, ctx.cwd, child):
             return None  # another project's own run_eval.py
         script = target.rsplit(".", 1)[-1] if kind == "module" else os.path.basename(target)[:-3]
+        help_only = asks_for_help(args, script)
         value = option_value(args, "--num-workers", script)
         try:
             one = value is not None and int(value) == 1
         except ValueError:
             one = False
-        if not one:
+        if not (one or help_only):
             self.add("`--num-workers 1` is missing")
+        # Checked for --help too: Python imports the scripts package before argparse runs.
         if not (no_bytecode or child.get("PYTHONDONTWRITEBYTECODE")):
             self.add("`PYTHONDONTWRITEBYTECODE=1` is not set")
+        if help_only:
+            return None  # argparse prints the usage and exits: no session, no skill copy
         mcp = None
         if ctx.cwd is None:
             self.add(UNKNOWN_FOLDER)
@@ -787,9 +791,7 @@ class Analyzer:
                 problem, mcp = mcp_setting(project_root(ctx.cwd, ctx.created))
                 if problem:
                     self.add(problem)
-        if asks_for_help(args, script):
-            return None  # argparse prints the usage and exits: nothing to confirm
-        missing = [f"`{o}`" for o in REQUIRED[script] if option_value(args, o, script) is None]
+        missing =[f"`{o}`" for o in REQUIRED[script] if option_value(args, o, script) is None]
         if missing:
             # argparse would stop the script before any session, so there is no size to confirm.
             self.add(f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} missing, which "
@@ -1036,10 +1038,15 @@ def run_self_tests() -> int:
                         "deny", "`--model` is missing, which run_loop requires")
             self.expect(self.bash(base + "run_eval --num-workers 1"),
                         "deny", "`--eval-set` and `--skill-path` are missing, which run_eval requires")
-            # --help prints the usage and exits: the rules still apply, but there is nothing to confirm.
-            self.expect(self.bash(base + "run_loop --num-workers 1 --help"), "allow")
-            self.expect(self.bash(base + "run_eval --num-workers 1 -h"), "allow")
-            self.expect(self.bash(base + "run_eval --he"), "deny", self.MISSING)
+            # --help prints the usage and exits before any session or skill copy: no worker, folder,
+            # MCP or required-option check and nothing to confirm. Bytecode still counts, because
+            # Python imports the scripts package first.
+            self.expect(self.bash(base + "run_loop --help"), "allow")
+            self.expect(self.bash(base + "run_eval -h"), "allow")
+            self.expect(self.bash(base + "run_eval --he"), "allow")
+            self.expect(self.bash(f"cd {self.cache} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --help"),
+                        "allow")
+            self.expect(self.bash(f"cd {self.cache} && python3 -m scripts.run_eval --help"), "deny", self.BYTECODE)
             # In run_loop --h also matches --holdout, so argparse rejects it as ambiguous; not help.
             self.expect(self.bash(base + "run_loop --num-workers 1 --h"), "deny", "`--eval-set`")
 

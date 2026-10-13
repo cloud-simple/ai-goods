@@ -112,7 +112,7 @@ The plugin adds two hooks:
 | Hook | Fires on | What it does |
 |---|---|---|
 | `PostToolUse`, matcher `Skill` | skill-creator loading | adds the eval rules to Claude's context |
-| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), runs where the copies would reach `~/.claude`, a git repository or, through a linked `.claude/` folder, anywhere else, leaves MCP servers on for the test sessions, or lacks an option the script requires; otherwise asks you to confirm the run, except for `--help` |
+| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), runs where the copies would reach `~/.claude`, a git repository or, through a linked `.claude/` folder, anywhere else, leaves MCP servers on for the test sessions, or lacks an option the script requires; otherwise asks you to confirm the run. A `--help` run starts no session and writes no skill copy, so only its bytecode is checked, and it gets no prompt |
 
 The test sessions start in the scratch folder and read its `.claude/settings.json`. The hook requires
 that file to set `allowedMcpServers`:
