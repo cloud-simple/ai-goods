@@ -141,7 +141,13 @@ Claude gets the size as the reason.
 
 The rules Claude gets when skill-creator loads cover the same ground: one worker, a scratch folder
 with MCP servers off, no bytecode, the cost of a run, one `run_eval` pass before any `run_loop`, and
-how to spot a round that failed sessions spoiled.
+how to spot a round that failed sessions spoiled. They also set the `run_loop` options:
+
+| Option | Rule | Why |
+|---|---|---|
+| `--max-iterations` | `3` unless you ask for more | caps the worst case at 3 rounds instead of 5; a loop that passes every training query stops earlier anyway |
+| `--runs-per-query` | keep the default `3`, unless you agree to `1` for a rough look | with one run, a query that triggers only some of the time passes or fails by chance |
+| `--holdout` | never `0` | the held-out queries run in every round anyway, so `0` saves no sessions; it only makes `run_loop` pick the best description by the score the rewrites were tuned against |
 
 The `Bash` hook reads the command the way a shell splits it:
 - **What it parses:** quotes, comments, heredocs, `;` `&&` `||` `|`, subshells and `$( )`.

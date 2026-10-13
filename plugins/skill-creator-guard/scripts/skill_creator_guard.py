@@ -78,6 +78,11 @@ toward the usage limit. One pass starts a session for every query, `--runs-per-q
 the model of every test session, not only of the rewrites.
 - Measure the current description with one `run_eval` pass first. Start `run_loop` only when that pass \
 shows misses worth fixing.
+- Pass `--max-iterations 3` to `run_loop` unless the user asks for more rounds. Keep `--runs-per-query` \
+at its default of 3 unless the user agrees to a rough single-run look: with one run, a query that \
+triggers in some runs and not in others passes or fails by chance. Never pass `--holdout 0`: \
+`run_loop` runs the held-out queries in every round anyway, so it saves no sessions, and without them \
+the best description is picked by the score the rewrites were tuned against.
 - A test session that fails, for example once the usage limit is reached, counts as a miss, and \
 `run_eval` prints no error for it. Treat a round as unproven when its recall drops sharply, it finishes \
 much faster than the round before, or the run ends with `claude -p exited`. Rerun it before acting on it.
@@ -1109,6 +1114,8 @@ def run_self_tests() -> int:
             for name in ("skill-creator:skill-creator", "anthropic-skills:skill-creator"):
                 self.expect(self.skill(name), "context", "--num-workers 1")
                 self.expect(self.skill(name), "context", "`claude -p exited`")
+                self.expect(self.skill(name), "context", "Pass `--max-iterations 3` to `run_loop`")
+                self.expect(self.skill(name), "context", '{"allowedMcpServers": []}')
             self.expect(self.skill("plugin-freshness:plugin-freshness"), "allow")
 
         def test_other_events_and_garbage_are_ignored(self):
