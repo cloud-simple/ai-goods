@@ -99,18 +99,20 @@ Four things go wrong:
 - **A run costs more than it looks.** Every test is a separate `claude -p` session that loads your
   whole Claude Code setup, MCP servers included, and counts toward your usage limit. With the
   defaults, 3 runs per query and 5 rounds, `run_loop` on a 20-query eval set starts up to 300 of
-  them. In `run_loop`, `--model` sets the model of every test session too. Nothing shows that number
-  before the run starts.
-- **Failed tests count as misses.** A test session that fails, for example once the usage limit is
-  reached, counts as a miss, and `run_eval` prints no error for it. A round cut short by the limit
-  reports a collapsed recall that says nothing about the description.
+  them, plus 1 or 2 more for each description rewrite. In `run_loop`, `--model` sets the model of
+  every test session too. Nothing shows those numbers before the run starts.
+- **Failed tests count as "not triggered".** A test session that fails, for example once the usage
+  limit is reached, counts as "not triggered", and `run_eval` prints no error for it. A
+  should-trigger query then fails and a should-not-trigger query passes: a round cut short by the
+  limit reports a collapsed recall and a perfect-looking precision, and neither says anything about
+  the description.
 
 The plugin adds two hooks:
 
 | Hook | Fires on | What it does |
 |---|---|---|
 | `PostToolUse`, matcher `Skill` | skill-creator loading | adds the eval rules to Claude's context |
-| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), runs where the copies would reach `~/.claude` or a git repository, or leaves MCP servers on for the test sessions; otherwise asks you to confirm the run |
+| `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), runs where the copies would reach `~/.claude`, a git repository or, through a linked `.claude/` folder, anywhere else, leaves MCP servers on for the test sessions, or lacks an option the script requires; otherwise asks you to confirm the run, except for `--help` |
 
 The test sessions start in the scratch folder and read its `.claude/settings.json`. The hook requires
 that file to set `allowedMcpServers`:
@@ -130,9 +132,9 @@ settings file:
 
 ```
 Confirm a skill-creator eval run. run_loop starts up to 300 test sessions (20 queries × 3 runs ×
-5 rounds) and up to 4 description rewrites, on claude-fable-5-1, with no MCP servers. Each test
-session is a separate `claude -p` run that loads your whole Claude Code setup and counts toward
-your usage limit.
+5 rounds) and up to 8 more sessions for up to 4 description rewrites, on claude-fable-5-1, with no
+MCP servers. Each test session is a separate `claude -p` run that loads your whole Claude Code
+setup and counts toward your usage limit.
 ```
 
 The number is a maximum: `run_loop` stops early when every training query passes. The prompt appears
