@@ -91,8 +91,17 @@ The plugin adds two hooks:
 | `PostToolUse`, matcher `Skill` | skill-creator loading | adds the eval rules to Claude's context |
 | `PreToolUse`, matcher `Bash` | a command that runs `run_eval` or `run_loop` | blocks it, with the reason and the rules, when it lacks `--num-workers 1`, leaves bytecode on (neither `PYTHONDONTWRITEBYTECODE=1` nor `python -B`), or runs where the copies would reach `~/.claude` or a git repository |
 
-Commands that only read the scripts, and every other command, pass through. If the hook itself
-fails, the command goes ahead.
+The `Bash` hook reads the command the way a shell splits it:
+- **What it parses:** quotes, comments, heredocs, `;` `&&` `||` `|`, subshells and `$( )`.
+- **What it tracks:** `cd`, `export` and `mkdir` as it goes.
+- **What counts as a run:** `python -m scripts.run_eval`, a path to `run_eval.py`, or the script run
+  directly, also behind `env`, `nohup`, `uv run` or `bash -c`.
+- **What it checks:** workers, bytecode and folder, against that command only.
+
+Text that only mentions the script, such as an `echo`, a `claude -p` prompt, a commit message or a
+comment, passes, and so does every other command. If the hook itself fails, the command goes ahead.
+It guards against mistakes, not deliberate evasion: `eval`, `source`, `python -c` and scripts written
+to a file are not followed.
 
 The hooks need `python3` 3.9 or newer. Self-tests, which build a throwaway home folder and never
 touch the real `~/.claude`:

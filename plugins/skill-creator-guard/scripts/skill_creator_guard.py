@@ -14,6 +14,14 @@ Two events, wired in the skill-creator-guard plugin's hooks/hooks.json:
   PostToolUse, matcher "Skill"  after skill-creator loads, add RULES to Claude's context.
   PreToolUse,  matcher "Bash"   deny a command that runs run_eval or run_loop and breaks a rule.
 
+The Bash check parses the command the way a shell splits it: quotes, escapes, comments, heredocs,
+separators, ( ) subshells, redirects and $( ) substitutions. It walks the simple commands in order,
+tracking the working directory (cd, uv run --directory), exported variables and folders made by
+mkdir. A command counts as an eval run only when it starts run_eval or run_loop itself; text in an
+echo, a prompt, a commit message or a comment does not. Workers, bytecode and location are checked
+against that command alone. This guards against mistakes, not against deliberate evasion: eval,
+source, a script written to a file and python -c are not followed.
+
 Any error inside the hook lets the tool call go ahead: the hook must never block unrelated work.
 
 Self-tests:  python3 skill_creator_guard.py --test
@@ -24,7 +32,6 @@ it, exactly as Claude Code calls it, so the real ~/.claude is never read or writ
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 
@@ -50,73 +57,246 @@ changing a description.
 
 The skill-creator-guard plugin's PreToolUse hook blocks a run that breaks these rules."""
 
-# A command that runs the scripts, not one that only reads them (grep, sed, cat).
-RUNS_EVAL = re.compile(r"\bpython[0-9.]*\s+(?:-\S+\s+)*(?:-m\s+scripts\.(?:run_eval|run_loop)\b|\S*\brun_(?:eval|loop)\.py\b)")
-ONE_WORKER = re.compile(r"--num-workers(?:\s+|=)1(?!\d)")
-NO_BYTECODE = re.compile(r"\bPYTHONDONTWRITEBYTECODE=1\b|\bpython[0-9.]*\s+(?:-\S+\s+)*-B\b")
-
-
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-
-
-def mask_quoted(command: str) -> str:
-    """Blank out heredoc bodies and the insides of quoted strings, keeping every position.
-
-    Text there is data, such as a `claude -p` prompt or a commit message, not a command, so a mention
-    of run_eval in it must not trigger the guard. The cost: a run hidden in `bash -c "..."` is masked
-    too and passes."""
-    chars = list(command)
-    for m in HEREDOC.finditer(command):
-        start = command.find("\n", m.end())
-        if start < 0:
-            continue
-        end = re.compile(r"^\t*" + re.escape(m.group(2)) + r"$", re.M).search(command, start + 1)
-        for i in range(start + 1, end.start() if end else len(command)):
-            if chars[i] != "\n":
-                chars[i] = " "
-    out, quote, escaped = chars[:], None, False
-    for i, c in enumerate(chars):
-        if escaped:
-            escaped = False
-            if quote:
-                out[i] = " "
-        elif c == "\\" and quote != "'":
-            escaped = True
-            if quote:
-                out[i] = " "
-        elif quote:
-            if c == quote:
-                quote = None
-            else:
-                out[i] = " "
-        elif c in "'\"":
-            quote = c
-    return "".join(out)
+EVAL_FILES = {"run_eval.py", "run_loop.py"}
+EVAL_MODULES = {"run_eval", "run_loop"}
+PYTHON = re.compile(r"python[0-9.]*")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+WRAPPERS = {"nohup", "time", "command", "exec", "builtin"}
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{"}
+ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+SEPARATORS = {";", "&&", "||", "|", "|&", "&", "\n", ";;"}
+REDIRECTS = {">", ">>", "<", "<>", ">|", "&>", "&>>", ">&", "<&"}
+# Longest first, so "<<<" wins over "<<" and "&&" over "&".
+OPERATORS = ["<<<", "&>>", "<<-", "&&", "||", ";;", "|&", ">>", "<<", ">&", "<&", "&>", "<>", ">|",
+             ";", "&", "|", "(", ")", "<", ">"]
+UV_VALUE_OPTIONS = {"--with", "--with-requirements", "--with-editable", "--python", "-p", "--directory",
+                    "--project", "--env-file", "--extra", "--group", "--package", "--index", "--index-url",
+                    "--from"}
+MAX_DEPTH = 6
 
 
 def emit(obj) -> None:
     print(json.dumps(obj))
 
 
-def effective_dir(command: str, cwd: str) -> str:
-    """The directory the scripts run in: the last `cd DIR` before the python call, else the hook's cwd."""
-    head = command[: RUNS_EVAL.search(mask_quoted(command)).start()]
-    target = cwd
-    for m in re.finditer(r"(?:^|[;&|(]\s*)cd\s+(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", head):
-        try:
-            arg = shlex.split(m.group(1))[0]
-        except ValueError:
+# ---------------------------------------------------------------- shell parsing
+
+def read_paren(text: str, i: int) -> tuple:
+    """Read the body of $( ... ) starting after "$(". Return (body, index after the closing paren)."""
+    depth, j, n = 1, i, len(text)
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            j += 2
             continue
-        arg = os.path.expandvars(os.path.expanduser(arg))
-        target = arg if os.path.isabs(arg) else os.path.join(target, arg)
-    return os.path.normpath(target)
+        if c in "'\"":
+            k = text.find(c, j + 1)
+            j = n if k < 0 else k + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i:j], j + 1
+        j += 1
+    return text[i:], n
 
 
-def project_root(directory: str):
-    """Mimic run_eval.find_project_root: the nearest directory, from here up, that holds .claude/."""
+def tokenize(text: str) -> tuple:
+    """Split shell text into tokens: ("w", word) with quotes removed, ("op", operator) and
+    ("heredoc", body). Also return the bodies of $( ) and backtick substitutions."""
+    tokens, subs = [], []
+    word, in_word = [], False
+    pending = []           # heredoc delimiters waiting for the next newline: (word, strip tabs)
+    delim_next = None      # set when the next word is a heredoc delimiter
+    herestring_next = False
+    i, n = 0, len(text)
+
+    def end_word():
+        nonlocal word, in_word, delim_next, herestring_next
+        if in_word:
+            w = "".join(word)
+            if delim_next is not None:
+                pending.append((w, delim_next))
+                delim_next = None
+            elif herestring_next:
+                tokens.append(("herestring", w))
+                herestring_next = False
+            else:
+                tokens.append(("w", w))
+        word, in_word = [], False
+
+    while i < n:
+        c = text[i]
+        if c in " \t":
+            end_word()
+            i += 1
+        elif c == "\n":
+            end_word()
+            tokens.append(("op", "\n"))
+            i += 1
+            for delim, strip in pending:
+                body = []
+                while i < n:
+                    j = text.find("\n", i)
+                    j = n if j < 0 else j
+                    line = text[i:j]
+                    i = min(j + 1, n)
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+                    body.append(line)
+                tokens.append(("heredoc", "\n".join(body)))
+            pending = []
+        elif c == "#" and not in_word:
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "\\":
+            if text.startswith("\n", i + 1):
+                i += 2
+            else:
+                word.append(text[i + 1:i + 2])
+                in_word = True
+                i += 2
+        elif c == "'":
+            j = text.find("'", i + 1)
+            j = n if j < 0 else j
+            word.append(text[i + 1:j])
+            in_word = True
+            i = j + 1
+        elif c == '"':
+            in_word = True
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n and text[i + 1] in '"\\$`\n':
+                    if text[i + 1] != "\n":
+                        word.append(text[i + 1])
+                    i += 2
+                elif text.startswith("$(", i):
+                    body, i = read_paren(text, i + 2)
+                    subs.append(body)
+                    word.append("$(" + body + ")")
+                elif text[i] == "`":
+                    j = text.find("`", i + 1)
+                    j = n if j < 0 else j
+                    subs.append(text[i + 1:j])
+                    word.append(text[i:j + 1])
+                    i = j + 1
+                else:
+                    word.append(text[i])
+                    i += 1
+            i += 1
+        elif text.startswith("$(", i):
+            body, i = read_paren(text, i + 2)
+            subs.append(body)
+            word.append("$(" + body + ")")
+            in_word = True
+        elif c == "`":
+            j = text.find("`", i + 1)
+            j = n if j < 0 else j
+            subs.append(text[i + 1:j])
+            word.append(text[i:j + 1])
+            in_word = True
+            i = j + 1
+        else:
+            op = next((o for o in OPERATORS if text.startswith(o, i)), None)
+            if op is None:
+                word.append(c)
+                in_word = True
+                i += 1
+                continue
+            end_word()
+            if op in ("<<", "<<-"):
+                delim_next = op == "<<-"
+            elif op == "<<<":
+                herestring_next = True
+            else:
+                tokens.append(("op", op))
+            i += len(op)
+    end_word()
+    return tokens, subs
+
+
+# ---------------------------------------------------------------- paths
+
+def home_dir() -> str:
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def real(path: str) -> str:
+    """realpath for a path that may not exist yet: resolve its nearest existing ancestor."""
+    path = os.path.abspath(path)
+    rest = []
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        rest.append(os.path.basename(path))
+        path = parent
+    return os.path.join(os.path.realpath(path), *reversed(rest))
+
+
+def nearest_existing(path: str) -> str:
+    while not os.path.exists(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return path
+
+
+class Ctx:
+    """What the shell knows at one point: working directory (None when unknown), exported variables,
+    and the folders mkdir has made so far (shared across the whole command)."""
+
+    def __init__(self, cwd, exports, created):
+        self.cwd, self.exports, self.created = cwd, exports, created
+
+    def copy(self):
+        return Ctx(self.cwd, dict(self.exports), self.created)
+
+
+def expand(word: str, ctx: Ctx, extra=None):
+    """Expand ~ and $VAR / ${VAR}. Return None when a variable is unknown."""
+    values = dict(os.environ)
+    values.update(ctx.exports)
+    values.update(extra or {})
+    unknown = []
+
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        if name in values:
+            return values[name]
+        unknown.append(name)
+        return ""
+
+    out = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", sub, word)
+    if unknown or "$" in out or "`" in out:
+        return None
+    return os.path.expanduser(out)
+
+
+def resolve(word, ctx: Ctx, extra=None):
+    """The absolute path a word names, relative to the tracked cwd, or None when it cannot be known."""
+    if word is None:
+        return home_dir()
+    path = expand(word, ctx, extra)
+    if path is None:
+        return None
+    if not os.path.isabs(path):
+        if ctx.cwd is None:
+            return None
+        path = os.path.join(ctx.cwd, path)
+    return real(os.path.normpath(path))
+
+
+def has_dir(path: str, created: set) -> bool:
+    return os.path.isdir(path) or any(c == path or c.startswith(path + os.sep) for c in created)
+
+
+def project_root(directory: str, created: set):
+    """Mimic run_eval.find_project_root: the nearest directory, from here up, that holds .claude/.
+    Folders made by an earlier mkdir in the same command count as existing."""
     path = directory
     while True:
-        if os.path.isdir(os.path.join(path, ".claude")):
+        if has_dir(os.path.join(path, ".claude"), created):
             return path
         parent = os.path.dirname(path)
         if parent == path:
@@ -133,42 +313,242 @@ def in_git_repo(directory: str) -> bool:
     return out.returncode == 0 and out.stdout.strip() == "true"
 
 
-def location_problem(directory: str):
-    home = os.path.realpath(os.path.expanduser("~"))
+def location_problem(directory: str, created: set):
+    home = home_dir()
     claude_home = os.path.join(home, ".claude")
-    real = os.path.realpath(directory)
-    if real == claude_home or real.startswith(claude_home + os.sep):
+    if directory == claude_home or directory.startswith(claude_home + os.sep):
         return f"it runs inside {claude_home}"
-    if not os.path.isdir(real):
-        return None  # created by this same command (mkdir -p); judged by the path alone above
-    root = project_root(real)
+    root = project_root(directory, created)
     if root is None or root == home:
         return ("the nearest folder with .claude/ is your home directory, so the skill copies go to "
                 "~/.claude/commands/ and show up in every session")
-    if in_git_repo(root):
+    if in_git_repo(nearest_existing(root)):
         return f"the nearest folder with .claude/ is {root}, which is inside a git repository"
     return None
 
 
+# ---------------------------------------------------------------- command analysis
+
+def workers_value(args: list):
+    """The value given to --num-workers, last one winning, as argparse does. argparse also accepts
+    unambiguous prefixes such as --num-w."""
+    value = None
+    for k, a in enumerate(args):
+        key, eq, v = a.partition("=")
+        if len(key) >= 5 and "--num-workers".startswith(key):
+            value = v if eq else (args[k + 1] if k + 1 < len(args) else None)
+    return value
+
+
+def eval_args(argv: list):
+    """When argv starts run_eval or run_loop, return (its arguments, whether python -B is set).
+    Otherwise None."""
+    name = os.path.basename(argv[0])
+    if name in EVAL_FILES:
+        return argv[1:], False
+    if not PYTHON.fullmatch(name):
+        return None
+    no_bytecode, j = False, 1
+    while j < len(argv):
+        a = argv[j]
+        if a == "--" or not a.startswith("-") or a == "-":
+            break
+        if a.startswith("--"):
+            j += 1
+            continue
+        flags, k = a[1:], 0
+        while k < len(flags):
+            f = flags[k]
+            if f == "B":
+                no_bytecode = True
+            elif f in "mcWX":
+                value = flags[k + 1:] or (argv[j + 1] if j + 1 < len(argv) else "")
+                consumed = 1 if flags[k + 1:] else 2
+                if f == "c":
+                    return None
+                if f == "m":
+                    module = value.rsplit(".", 1)[-1]
+                    if module in EVAL_MODULES and value in (module, "scripts." + module) \
+                            or value.endswith(".scripts." + module) and module in EVAL_MODULES:
+                        return argv[j + consumed:], no_bytecode
+                    return None
+                j += consumed - 1
+                break
+            k += 1
+        j += 1
+    if j < len(argv) and argv[j] == "--":
+        j += 1
+    if j < len(argv) and os.path.basename(argv[j]) in EVAL_FILES:
+        return argv[j + 1:], no_bytecode
+    return None
+
+
+class Analyzer:
+    def __init__(self):
+        self.problems = []
+
+    def add(self, problem: str) -> None:
+        if problem not in self.problems:
+            self.problems.append(problem)
+
+    def script(self, text: str, ctx: Ctx, depth: int = 0) -> None:
+        if depth > MAX_DEPTH:
+            return
+        tokens, subs = tokenize(text)
+        stack = [ctx]
+        argv, redirect_next, herestring = [], False, None
+        last = None  # (shell?, ctx) of the command a following heredoc belongs to
+
+        def finish():
+            nonlocal argv, herestring, last
+            if argv:
+                last = self.command(argv, stack[-1], depth)
+                if herestring is not None and last and last[0]:
+                    self.script(herestring, last[1].copy(), depth + 1)
+            argv, herestring = [], None
+
+        for kind, value in tokens:
+            if kind == "w":
+                if redirect_next:
+                    redirect_next = False
+                else:
+                    argv.append(value)
+            elif kind == "herestring":
+                herestring = value
+            elif kind == "heredoc":
+                if last and last[0]:
+                    self.script(value, last[1].copy(), depth + 1)
+            elif value in SEPARATORS:
+                finish()
+            elif value == "(":
+                finish()
+                stack.append(stack[-1].copy())
+            elif value == ")":
+                finish()
+                if len(stack) > 1:
+                    stack.pop()
+            elif value in REDIRECTS:
+                redirect_next = True
+        finish()
+        for body in subs:
+            self.script(body, stack[0].copy(), depth + 1)
+
+    def command(self, argv: list, ctx: Ctx, depth: int, env=None):
+        """Analyze one simple command. Return (is a shell reading stdin, ctx) for heredoc routing."""
+        env = dict(env or {})
+        i = 0
+        while i < len(argv) and (ASSIGN.fullmatch(argv[i]) or argv[i] in KEYWORDS):
+            if ASSIGN.fullmatch(argv[i]):
+                key, _, value = argv[i].partition("=")
+                env[key] = value
+            i += 1
+        argv = argv[i:]
+        while argv:
+            name = os.path.basename(argv[0])
+            if name == "env":
+                j = 1
+                while j < len(argv) and (argv[j].startswith("-") or ASSIGN.fullmatch(argv[j])):
+                    if ASSIGN.fullmatch(argv[j]):
+                        key, _, value = argv[j].partition("=")
+                        env[key] = value
+                    j += 2 if argv[j] in ("-u", "--unset", "-C", "--chdir") else 1
+                argv = argv[j:]
+            elif name in WRAPPERS:
+                argv = argv[1:]
+            elif name == "nice":
+                argv = argv[3:] if argv[1:2] == ["-n"] else argv[1:]
+            elif name == "timeout":
+                j = 1
+                while j < len(argv) and argv[j].startswith("-"):
+                    j += 2 if argv[j] in ("-s", "--signal", "-k", "--kill-after") else 1
+                argv = argv[j + 1:]
+            else:
+                break
+        if not argv:
+            return None
+        name = os.path.basename(argv[0])
+
+        if name in ("cd", "pushd"):
+            args = [a for a in argv[1:] if not (a.startswith("-") and a != "-")]
+            ctx.cwd = None if args[:1] == ["-"] else resolve(args[0] if args else None, ctx, env)
+            return None
+        if name == "export":
+            for a in argv[1:]:
+                if ASSIGN.fullmatch(a):
+                    key, _, value = a.partition("=")
+                    ctx.exports[key] = expand(value, ctx, env) or value
+            return None
+        if name == "unset":
+            for a in argv[1:]:
+                ctx.exports.pop(a, None)
+            return None
+        if name == "mkdir":
+            j = 1
+            while j < len(argv):
+                a = argv[j]
+                if a in ("-m", "--mode"):
+                    j += 2
+                    continue
+                if not a.startswith("-"):
+                    path = resolve(a, ctx, env)
+                    if path:
+                        ctx.created.add(path)
+                j += 1
+            return None
+        if name in SHELLS:
+            if "-c" in argv[1:-1]:
+                self.script(argv[argv.index("-c") + 1], ctx.copy(), depth + 1)
+                return None
+            return (True, ctx.copy())
+        if name == "uv" and argv[1:2] == ["run"]:
+            sub, j = ctx.copy(), 2
+            while j < len(argv) and argv[j].startswith("-") and argv[j] != "--":
+                key, eq, value = argv[j].partition("=")
+                if key == "--directory":
+                    sub.cwd = resolve(value if eq else (argv[j + 1] if j + 1 < len(argv) else None), ctx, env)
+                j += 1 if eq or key not in UV_VALUE_OPTIONS else 2
+            if j < len(argv) and argv[j] == "--":
+                j += 1
+            return self.command(argv[j:], sub, depth, env) if j < len(argv) else None
+
+        found = eval_args(argv)
+        if found is None:
+            return None
+        args, no_bytecode = found
+        value = workers_value(args)
+        try:
+            one = value is not None and int(value) == 1
+        except ValueError:
+            one = False
+        if not one:
+            self.add("`--num-workers 1` is missing")
+        merged = dict(os.environ)
+        merged.update(ctx.exports)
+        merged.update(env)
+        if not (no_bytecode or merged.get("PYTHONDONTWRITEBYTECODE")):
+            self.add("`PYTHONDONTWRITEBYTECODE=1` is not set")
+        if ctx.cwd is not None:
+            where = location_problem(ctx.cwd, ctx.created)
+            if where:
+                self.add(where)
+        return None
+
+
+# ---------------------------------------------------------------- hook events
+
 def pre_tool_use(data: dict) -> None:
     command = (data.get("tool_input") or {}).get("command") or ""
-    visible = mask_quoted(command)  # quoted text and heredocs are data, not the command
-    if not RUNS_EVAL.search(visible):
-        return
-    problems = []
-    if not ONE_WORKER.search(visible):
-        problems.append("`--num-workers 1` is missing")
-    if not NO_BYTECODE.search(visible):
-        problems.append("`PYTHONDONTWRITEBYTECODE=1` is not set")
-    where = location_problem(effective_dir(command, data.get("cwd") or os.getcwd()))
-    if where:
-        problems.append(where)
-    if not problems:
+    if not re.search(r"run_(?:eval|loop)", command):
+        return  # fast path: nothing to parse
+    analyzer = Analyzer()
+    cwd = data.get("cwd") or os.getcwd()
+    analyzer.script(command, Ctx(real(cwd), {}, set()))
+    if not analyzer.problems:
         return
     emit({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(problems)
+        "permissionDecisionReason": "Blocked a skill-creator eval run: " + "; ".join(analyzer.problems)
                                     + ".\n\n" + RULES,
     }})
 
@@ -179,6 +559,8 @@ def post_tool_use(data: dict) -> None:
         return
     emit({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": RULES}})
 
+
+# ---------------------------------------------------------------- self-tests
 
 def run_self_tests() -> int:
     import shutil
@@ -212,7 +594,8 @@ def run_self_tests() -> int:
 
         def hook(self, payload, raw=None):
             """Run this script the way Claude Code does: JSON on stdin, HOME set to the fake home."""
-            env = dict(os.environ, HOME=self.home)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+            env["HOME"] = self.home
             p = subprocess.run([sys.executable, os.path.abspath(__file__)],
                                input=raw if raw is not None else json.dumps(payload),
                                capture_output=True, text=True, env=env, timeout=30)
@@ -232,89 +615,144 @@ def run_self_tests() -> int:
             return self.hook({"hook_event_name": "PostToolUse", "tool_name": "Skill",
                               "cwd": self.scratch, "tool_input": {"skill": name}})
 
-        def good(self):
-            return (f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH={self.cache} "
-                    "python3 -m scripts.run_eval --eval-set e.json --skill-path x --num-workers 1")
+        RUN = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --eval-set e.json --skill-path x --num-workers 1"
+
+        def good(self, where=None):
+            return f"cd {where or self.scratch} && {self.RUN}"
 
         def expect(self, result, decision, needle=""):
             self.assertEqual(result[0], decision, result[1][:300])
             self.assertIn(needle, result[1])
 
+        # Allowed runs.
+
         def test_good_run_is_allowed(self):
             self.expect(self.bash(self.good()), "allow")
             self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers=1")), "allow")
+            self.expect(self.bash(self.good().replace("--num-workers 1", '--num-workers "1"')), "allow")
+            self.expect(self.bash(self.good().replace("--num-workers 1", "--num-w 1")), "allow")
             no_env = self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")
             self.expect(self.bash(no_env.replace("python3 -m", "python3 -B -m")), "allow")
+            self.expect(self.bash(no_env.replace("python3 -m", "python3 -Bm")), "allow")
+            self.expect(self.bash(f"export PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "allow")
+            self.expect(self.bash(no_env.replace("python3", "env PYTHONDONTWRITEBYTECODE=1 python3")), "allow")
+            self.expect(self.bash(f'cd "{self.scratch}" && PYTHONDONTWRITEBYTECODE=1 '
+                                  f'python3 "{self.cache}/scripts/run_eval.py" --num-workers 1'), "allow")
+
+        def test_folder_created_by_the_same_command_is_allowed(self):
+            new = os.path.join(self.home, "not-yet")
+            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "allow")
+
+        def test_quoted_cd_paths_count(self):
+            spaced = os.path.join(self.home, "scratch dir")
+            os.makedirs(os.path.join(spaced, ".claude"), exist_ok=True)
+            self.expect(self.bash(f'cd "{spaced}" && {self.RUN}'), "allow")
+            self.expect(self.bash(f"cd '{self.cache}' && {self.RUN}"), "deny", "it runs inside")
+
+        # Blocked runs.
 
         def test_parallel_runs_are_blocked(self):
             missing = "`--num-workers 1` is missing"
             self.expect(self.bash(self.good().replace(" --num-workers 1", "")), "deny", missing)
             self.expect(self.bash(self.good().replace("--num-workers 1", "--num-workers 12")), "deny", missing)
-            loop = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 10 --model m"
+            self.expect(self.bash(self.good() + " --num-workers 4"), "deny", missing)  # the last one wins
+            loop = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_loop --num-workers 10"
             self.expect(self.bash(loop), "deny", missing)
 
-        def test_bytecode_must_be_off(self):
-            self.expect(self.bash(self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")), "deny",
-                        "`PYTHONDONTWRITEBYTECODE=1` is not set")
+        def test_bytecode_must_be_off_for_the_eval_itself(self):
+            off = "`PYTHONDONTWRITEBYTECODE=1` is not set"
+            self.expect(self.bash(self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")), "deny", off)
+            # Set for another command only, or as a plain shell variable that is not exported.
+            no_env = self.good().replace("PYTHONDONTWRITEBYTECODE=1 ", "")
+            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1 echo x; {no_env}"), "deny", off)
+            self.expect(self.bash(f"PYTHONDONTWRITEBYTECODE=1\n{no_env}"), "deny", off)
+
+        def test_flags_elsewhere_do_not_count(self):
+            bare = f"cd {self.scratch} && python3 -m scripts.run_eval"
+            result = self.bash(f"echo --num-workers 1 PYTHONDONTWRITEBYTECODE=1; {bare}")
+            self.expect(result, "deny", "`--num-workers 1` is missing")
+            self.assertIn("`PYTHONDONTWRITEBYTECODE=1` is not set", result[1])
+
+        def test_every_way_of_starting_the_script_is_seen(self):
+            missing = "`--num-workers 1` is missing"
+            self.expect(self.bash(f"cd {self.cache} && ./scripts/run_eval.py --num-workers 10"), "deny", missing)
+            self.expect(self.bash(f'PYTHONDONTWRITEBYTECODE=1 python3 "{self.cache}/scripts/run_eval.py"'),
+                        "deny", missing)
+            self.expect(self.bash(f'cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m "scripts.run_eval"'),
+                        "deny", missing)
+            bad = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval"
+            self.expect(self.bash(f'bash -c "{bad}"'), "deny", missing)
+            self.expect(self.bash(f"bash <<'EOF'\n{bad}\nEOF"), "deny", missing)
+            self.expect(self.bash(f"x=$({bad})"), "deny", missing)
+            self.expect(self.bash(f"cd {self.scratch} && nohup python3 -m scripts.run_eval > log 2>&1 &"),
+                        "deny", missing)
+            uv = (f"PYTHONDONTWRITEBYTECODE=1 uv run --with anthropic --directory {self.cache} "
+                  "python -m scripts.run_loop --num-workers 1")
+            self.expect(self.bash(uv), "deny", "it runs inside")
 
         def test_wrong_places_are_blocked(self):
-            self.expect(self.bash(self.good().replace(f"cd {self.scratch}", f"cd {self.cache}")), "deny",
-                        "it runs inside " + os.path.join(self.home, ".claude"))
-            self.expect(self.bash(self.good().replace(f"cd {self.scratch}", "cd ~")), "deny", "home directory")
+            self.expect(self.bash(self.good(self.cache)), "deny", "it runs inside " + os.path.join(self.home, ".claude"))
+            self.expect(self.bash(self.good("~")), "deny", "home directory")
+            self.expect(self.bash(self.good(os.path.join(self.home, "nowhere"))), "deny", "home directory")
             # No cd: the hook's cwd decides. A repo without .claude/ sends the copies to the home folder.
-            no_cd = f"PYTHONDONTWRITEBYTECODE=1 python3 {self.cache}/scripts/run_eval.py --num-workers 1"
-            self.expect(self.bash(no_cd, cwd=self.repo_plain), "deny", "home directory")
+            self.expect(self.bash(self.RUN, cwd=self.repo_plain), "deny", "home directory")
 
-        def test_repo_with_its_own_claude_folder_is_blocked(self):
+        def test_repo_cases_are_blocked(self):
             if not self.has_git:
                 self.skipTest("git is not installed")
-            cmd = self.good().replace(f"cd {self.scratch}", f"cd {self.repo_claude}")
-            self.expect(self.bash(cmd), "deny", "inside a git repository")
+            git = "inside a git repository"
+            self.expect(self.bash(self.good(self.repo_claude)), "deny", git)
+            # A cd inside a subshell does not move the eval.
+            self.expect(self.bash(f"(cd {self.scratch}) && {self.RUN}", cwd=self.repo_claude), "deny", git)
+            # A cd on a later line does.
+            self.expect(self.bash(f"echo ok\ncd {self.repo_claude}\n{self.RUN}"), "deny", git)
+            # A folder made inside a repo is still inside the repo.
+            new = os.path.join(self.repo_claude, "new")
+            self.expect(self.bash(f"mkdir -p {new}/.claude && {self.good(new)}"), "deny", git)
 
-        def test_folder_created_by_the_same_command_is_allowed(self):
-            new = os.path.join(self.home, "not-yet")
-            cmd = f"mkdir -p {new}/.claude && " + self.good().replace(f"cd {self.scratch}", f"cd {new}")
-            self.expect(self.bash(cmd), "allow")
+        # Text that only mentions the script.
 
-        def test_reading_the_scripts_is_allowed(self):
-            self.expect(self.bash(f"cd {self.cache} && grep -n num_workers scripts/run_eval.py"), "allow")
-            self.expect(self.bash(f"sed -n 1,20p {self.cache}/scripts/run_eval.py"), "allow")
-            self.expect(self.bash("git status"), "allow")
+        def test_mentions_are_allowed(self):
+            bad = "cd /tmp && python3 -m scripts.run_eval --help"
+            for cmd in (f'claude -p "hook test: run {bad}" --max-turns 3',
+                        f"git commit -m 'note: {bad} breaks the rules'",
+                        f"git commit -F - <<'EOF'\nfix: {bad}\nEOF\ngit log -1",
+                        f'echo "it ran \\"{bad}\\" here"',
+                        "echo python3 -m scripts.run_eval --help",
+                        f"ls  # {bad}",
+                        f"cd {self.cache} && grep -n num_workers scripts/run_eval.py",
+                        f"sed -n 1,20p {self.cache}/scripts/run_eval.py",
+                        "git status"):
+                with self.subTest(cmd=cmd):
+                    self.expect(self.bash(cmd), "allow")
+
+        def test_quoted_heredoc_marker_hides_nothing(self):
+            bad = f"cd {self.scratch} && PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval"
+            self.expect(self.bash(f'echo "<<EOF"\n{bad}'), "deny", "`--num-workers 1` is missing")
+            self.expect(self.bash(f"cat <<EOF > notes.txt\nhello\nEOF\n{bad}"), "deny", "`--num-workers 1` is missing")
+
+        # The Skill hook and the rest.
 
         def test_rules_follow_skill_creator_only(self):
             for name in ("skill-creator:skill-creator", "anthropic-skills:skill-creator"):
                 self.expect(self.skill(name), "context", "--num-workers 1")
             self.expect(self.skill("plugin-freshness:plugin-freshness"), "allow")
 
-        def test_mentions_in_quotes_and_heredocs_are_allowed(self):
-            bad = "cd /tmp && python3 -m scripts.run_eval --help"
-            self.expect(self.bash(f'claude -p "hook test: run {bad}" --max-turns 3'), "allow")
-            self.expect(self.bash(f"git commit -m 'note: {bad} breaks the rules'"), "allow")
-            self.expect(self.bash(f"git commit -F - <<'EOF'\nfix: {bad}\nEOF\ngit log -1"), "allow")
-            self.expect(self.bash(f'echo "it ran \\"{bad}\\" here"'), "allow")
-            # A real run after a heredoc is still caught.
-            self.expect(self.bash(f"cat <<EOF > notes.txt\nhello\nEOF\n{bad}"), "deny", "--num-workers 1")
-
-        def test_quoted_cd_paths_still_count(self):
-            spaced = os.path.join(self.home, "scratch dir")
-            os.makedirs(os.path.join(spaced, ".claude"), exist_ok=True)
-            run = "PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.run_eval --num-workers 1"
-            self.expect(self.bash(f'cd "{spaced}" && {run}'), "allow")
-            self.expect(self.bash(f"cd '{self.cache}' && {run}"), "deny", "it runs inside")
-
-        def test_mask_keeps_positions(self):
-            for cmd in ("a 'b c' \"d \\\" e\" f", "x <<'EOF'\nbody 'q'\nEOF\ny", 'cd "a b" && z'):
-                self.assertEqual(len(mask_quoted(cmd)), len(cmd))
-            self.assertEqual(mask_quoted("a 'b c' d"), "a '   ' d")
-            self.assertEqual(mask_quoted('e "f\\"g" h'), 'e "    " h')
-            # The quoted marker is blanked too; only its name is lost, and the body is still masked.
-            self.assertEqual(mask_quoted("x <<'EOF'\nab\nEOF\ny"), "x <<'   '\n  \nEOF\ny")
-
         def test_other_events_and_garbage_are_ignored(self):
             self.expect(self.hook(None, raw="not json"), "allow")
             self.expect(self.hook({"hook_event_name": "PostToolUse", "tool_name": "Bash",
                                    "tool_input": {"command": self.good().replace(" --num-workers 1", "")}}),
                         "allow")
+
+        def test_tokenizer(self):
+            words = lambda s: [v for k, v in tokenize(s)[0] if k == "w"]
+            self.assertEqual(words("a 'b c' \"d \\\" e\" f\\ g"), ["a", "b c", 'd " e', "f g"])
+            self.assertEqual(words("a # b c"), ["a"])
+            self.assertEqual(words("x=$(echo 'a b') y"), ["x=$(echo 'a b')", "y"])
+            toks, subs = tokenize("cat <<-EOF > f\n\tbody\n\tEOF\nnext")
+            self.assertIn(("heredoc", "\tbody"), toks)
+            self.assertEqual([v for k, v in toks if k == "w"], ["cat", "f", "next"])
+            self.assertEqual(tokenize("a `b c` d")[1], ["b c"])
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
