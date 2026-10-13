@@ -1,0 +1,10 @@
+{
+  "name": "skill-creator-guard",
+  "description": "Hooks that keep skill-creator's trigger evals honest: they add the eval rules when skill-creator loads, and block a run_eval or run_loop run with parallel workers, from the plugin cache or home folder, or without PYTHONDONTWRITEBYTECODE=1",
+  "version": "0.1.0",
+  "author": {
+    "name": "cloud-simple"
+  },
+  "homepage": "https://github.com/cloud-simple/ai-goods",
+  "repository": "https://github.com/cloud-simple/ai-goods"
+}
